@@ -5,7 +5,7 @@ const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : mockInvoke;
 
 // ---------- state ----------
 const HIST = 90;
-const hist = { cpu: [], mem: [], dr: [], dw: [], rx: [], tx: [] };
+const hist = { cpu: [], mem: [], gpu: [], dr: [], dw: [], rx: [], tx: [] };
 const state = {
   snap: null,
   sortKey: "cpu",
@@ -20,6 +20,8 @@ const state = {
   tab: "procs",
   conns: null,
   startup: null,
+  onlyUnsigned: false,
+  hash: null, // { pid, sha256 } for the selected process
 };
 
 const $ = (id) => document.getElementById(id);
@@ -84,7 +86,7 @@ function spark(canvas, series, colors, max) {
 }
 
 const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
-const COLORS = { cpu: css("--cpu"), mem: css("--mem"), disk: css("--disk"), net: css("--net"), net2: css("--net-2") };
+const COLORS = { cpu: css("--cpu"), mem: css("--mem"), gpu: css("--gpu"), disk: css("--disk"), net: css("--net"), net2: css("--net-2") };
 
 function push(arr, v) { arr.push(v); if (arr.length > HIST) arr.shift(); }
 
@@ -92,12 +94,15 @@ function push(arr, v) { arr.push(v); if (arr.length > HIST) arr.shift(); }
 function renderMetrics(s) {
   push(hist.cpu, s.cpu);
   push(hist.mem, (s.memUsed / s.memTotal) * 100);
+  push(hist.gpu, s.gpu);
   push(hist.dr, s.diskRead); push(hist.dw, s.diskWrite);
   push(hist.rx, s.netRx); push(hist.tx, s.netTx);
 
   $("m-cpu").textContent = s.cpu.toFixed(0) + "%";
   $("m-mem").textContent = ((s.memUsed / s.memTotal) * 100).toFixed(0) + "%";
   $("m-mem-sub").textContent = `${fmtBytes(s.memUsed)} / ${fmtBytes(s.memTotal)} · swap ${fmtBytes(s.swapUsed)}`;
+  $("m-gpu").textContent = s.gpu.toFixed(0) + "%";
+  $("m-gpu-sub").textContent = `VRAM ${fmtBytes(s.gpuMem)} in use`;
   $("m-disk").textContent = fmtRate(s.diskRead + s.diskWrite);
   $("m-disk-sub").textContent = `R ${fmtRate(s.diskRead)} · W ${fmtRate(s.diskWrite)}`;
   $("m-net").textContent = fmtRate(s.netRx + s.netTx);
@@ -105,6 +110,7 @@ function renderMetrics(s) {
 
   spark($("c-cpu"), [hist.cpu], [COLORS.cpu], 100);
   spark($("c-mem"), [hist.mem], [COLORS.mem], 100);
+  spark($("c-gpu"), [hist.gpu], [COLORS.gpu], 100);
   spark($("c-disk"), [hist.dr, hist.dw], [COLORS.disk, COLORS.net2]);
   spark($("c-net"), [hist.rx, hist.tx], [COLORS.net, COLORS.net2]);
 
@@ -117,7 +123,16 @@ function renderMetrics(s) {
 
   $("s-count").textContent = `${s.procs.length} processes`;
   $("s-uptime").textContent = `Up ${fmtDur(s.uptime)}`;
+
+  const flagged = s.procs.filter(isFlagged).length;
+  const chip = $("s-unsigned");
+  chip.hidden = !flagged && !state.onlyUnsigned;
+  chip.classList.toggle("on", state.onlyUnsigned);
+  chip.textContent = state.onlyUnsigned ? `Showing ${flagged} unsigned ✕` : `⚠ ${flagged} unsigned`;
+  chip.title = state.onlyUnsigned ? "Show all processes" : "Show only processes whose program isn't signed, or whose signature is invalid";
 }
+
+const isFlagged = (p) => p.sig === "unsigned" || p.sig === "invalid";
 
 // ---------- table ----------
 const cmp = (key, dir) => (a, b) => {
@@ -126,6 +141,7 @@ const cmp = (key, dir) => (a, b) => {
 };
 
 function matches(p, f) {
+  if (state.onlyUnsigned && !isFlagged(p)) return false;
   return !f || p.name.toLowerCase().includes(f) || String(p.pid).startsWith(f);
 }
 
@@ -142,8 +158,9 @@ function buildRows(procs) {
     for (const p of procs) {
       if (!matches(p, f)) continue;
       let g = groups.get(p.name);
-      if (!g) groups.set(p.name, (g = { name: p.name, pid: p.pid, pids: [], cpu: 0, mem: 0, diskRead: 0, diskWrite: 0, conns: 0, listening: 0, net: 0, netRx: 0, netTx: 0 }));
+      if (!g) groups.set(p.name, (g = { name: p.name, pid: p.pid, pids: [], cpu: 0, gpu: 0, mem: 0, diskRead: 0, diskWrite: 0, conns: 0, listening: 0, net: 0, netRx: 0, netTx: 0, sig: p.sig, signer: p.signer }));
       g.pids.push(p.pid); g.cpu += p.cpu; g.mem += p.mem; g.diskRead += p.diskRead; g.diskWrite += p.diskWrite;
+      g.gpu = Math.max(g.gpu, p.gpu);
       g.conns += p.conns; g.listening += p.listening;
       g.net += p.net; g.netRx += p.netRx; g.netTx += p.netTx;
       g.pid = Math.min(g.pid, p.pid);
@@ -196,11 +213,15 @@ function renderTable() {
       ? `<span class="twist" data-twist="${p.pid}">${r.hasKids ? (state.collapsed.has(p.pid) && !state.filter ? "▸" : "▾") : ""}</span>`
       : "";
     const count = r.group && p.pids.length > 1 ? `<span class="count">×${p.pids.length}</span>` : "";
+    // Only problems get a badge; signed processes stay uncluttered.
+    const badge = p.sig === "unsigned" ? `<span class="sig-badge unsigned" title="Not signed">⚠</span>`
+      : p.sig === "invalid" ? `<span class="sig-badge invalid" title="Signature invalid or untrusted">✕</span>` : "";
     html.push(
       `<tr data-pid="${p.pid}"${r.group ? ` data-group="${esc(p.name)}"` : ""} class="${selected ? "sel" : ""}">` +
-        `<td style="padding-left:${12 + r.depth * 16}px">${twist}${esc(p.name)}${count}</td>` +
+        `<td style="padding-left:${12 + r.depth * 16}px" title="${p.signer ? `Signed by ${esc(p.signer)}` : ""}">${twist}${badge}${esc(p.name)}${count}</td>` +
         `<td class="num">${r.group ? "" : p.pid}</td>` +
         `<td class="num${p.cpu > 1 ? " hot" : ""}" style="${heat(p.cpu, 50, "79,209,197")}">${fmtPct(p.cpu)}</td>` +
+        `<td class="num narrow${p.gpu > 1 ? " hot" : ""}" style="${heat(p.gpu, 60, "104,211,145")}">${p.gpu < 0.5 ? "–" : p.gpu.toFixed(0) + "%"}</td>` +
         `<td class="num${p.mem > 2e8 ? " hot" : ""}" style="${heat(p.mem, memMax, "167,139,250")}">${fmtBytes(p.mem)}</td>` +
         `<td class="num" style="${heat(p.diskRead, 2e7, "246,173,85")}">${fmtRate(p.diskRead)}</td>` +
         `<td class="num" style="${heat(p.diskWrite, 2e7, "246,173,85")}">${fmtRate(p.diskWrite)}</td>` +
@@ -211,7 +232,7 @@ function renderTable() {
   }
   tbody.innerHTML = html.join("");
 
-  document.querySelectorAll("thead th").forEach((th) => {
+  document.querySelectorAll("#procs thead th").forEach((th) => {
     th.classList.toggle("sorted", th.dataset.sort === state.sortKey);
     th.classList.toggle("asc", th.dataset.sort === state.sortKey && state.sortDir === 1);
   });
@@ -228,6 +249,7 @@ async function select(sel) {
   state.sel = sel;
   state.details = null;
   state.conns = null;
+  state.hash = null;
   renderTable();
   if (!sel) { $("panel").hidden = true; return; }
   $("panel").hidden = false;
@@ -274,6 +296,7 @@ function renderPanel() {
   const sum = (k) => live.reduce((a, p) => a + p[k], 0);
   $("d-cpu").textContent = fmtPct(sum("cpu"));
   $("d-mem").textContent = fmtBytes(sum("mem"));
+  $("d-gpu").textContent = `${live.reduce((a, p) => Math.max(a, p.gpu), 0).toFixed(0)}%`;
   $("d-disk").textContent = fmtRate(sum("diskRead") + sum("diskWrite"));
   $("d-net").textContent = state.snap.bandwidth ? `↓ ${fmtRate(sum("netRx"))} ↑ ${fmtRate(sum("netTx"))}` : "needs admin";
 
@@ -287,12 +310,14 @@ function renderPanel() {
     $("d-open").hidden = true;
     $("d-kill").firstChild.textContent = `End all ${live.length} `;
     $("d-killtree").hidden = true;
+    renderSig(live[0], false);
     return;
   }
   $("d-prio-wrap").hidden = false;
   $("d-open").hidden = false;
   $("d-killtree").hidden = false;
   $("d-kill").firstChild.textContent = "End task ";
+  renderSig(live[0] || d, true);
   if (!d) return;
 
   $("d-name").textContent = d.name;
@@ -309,6 +334,50 @@ function renderPanel() {
   $("d-prio").value = d.priority || "";
   $("d-prio").disabled = !d.priority;
 }
+
+// Signature line + hash / VirusTotal for the selected process.
+function renderSig(p, allowHash) {
+  const box = $("d-sig-status");
+  // Live rows carry sig/signer as fields; the details response nests them in an object.
+  const sig = typeof p?.sig === "string" ? p.sig : p?.sig?.status;
+  const signer = p?.signer ?? p?.sig?.signer;
+  const text = {
+    valid: [`<b>✓ Signed</b>${signer ? ` by ${esc(signer)}` : ""}`, ""],
+    unsigned: ["<b>⚠ Not signed</b>", "Lots of small tools are unsigned, so this isn't proof of anything. Worth a VirusTotal check if you don't recognize it."],
+    invalid: ["<b>✕ Signature invalid or untrusted</b>", "The file was changed after signing, or it's signed by a certificate Windows doesn't trust. Be suspicious."],
+    unknown: ["<b>Signature unknown</b>", "Couldn't check this file. Running as admin can help."],
+  }[sig] || ["Checking signature…", ""];
+  box.className = `sig-status ${sig || ""}`;
+  box.innerHTML = text[0] + (text[1] ? `<span class="why">${text[1]}</span>` : "");
+
+  const h = state.hash && state.hash.pid === state.sel?.pid ? state.hash : null;
+  $("d-hash-btn").hidden = !allowHash || !!h;
+  $("d-hash").hidden = !h;
+  $("d-vt").hidden = !h;
+  if (h) $("d-hash").textContent = h.sha256;
+}
+
+$("d-hash-btn").addEventListener("click", async () => {
+  const pid = state.sel?.pid;
+  if (pid == null) return;
+  $("d-hash-btn").textContent = "Hashing…";
+  $("d-hash-btn").disabled = true;
+  try {
+    const r = await invoke("file_hash", { pid });
+    state.hash = { pid, sha256: r.sha256 };
+  } catch (e) { toast(e, true); }
+  $("d-hash-btn").textContent = "Get SHA-256";
+  $("d-hash-btn").disabled = false;
+  renderPanel();
+});
+$("d-vt").addEventListener("click", () => {
+  if (state.hash) invoke("open_virustotal", { sha256: state.hash.sha256 }).catch((e) => toast(e, true));
+});
+$("s-unsigned").addEventListener("click", () => {
+  state.onlyUnsigned = !state.onlyUnsigned;
+  if (state.tab !== "procs") setTab("procs");
+  if (state.snap) renderMetrics(state.snap), renderTable();
+});
 
 // ---------- actions ----------
 function confirmBox(title, body, yes = "End") {
@@ -357,19 +426,310 @@ function setMode(m) {
 }
 
 // ---------- tabs ----------
+const TABS = ["procs", "history", "services", "startup", "rules"];
+const SEARCH_PLACEHOLDER = { procs: "Filter by name or PID", services: "Filter services", startup: "Filter startup apps" };
+
 function setTab(tab) {
   state.tab = tab;
   document.querySelectorAll("#tabs button").forEach((b) => b.classList.toggle("on", b.dataset.tab === tab));
-  $("view-procs").hidden = tab !== "procs";
-  $("view-startup").hidden = tab !== "startup";
-  $("view-rules").hidden = tab !== "rules";
-  $("modes").style.visibility = tab === "procs" ? "" : "hidden";
-  $("search").parentElement.style.visibility = tab === "rules" ? "hidden" : "";
-  $("search").placeholder = tab === "startup" ? "Filter startup apps" : "Filter by name or PID";
-  if (tab === "procs") renderTable();
+  for (const t of TABS) $(`view-${t}`).hidden = t !== tab;
+  $("modes").style.display = tab === "procs" ? "" : "none";
+  $("search").parentElement.style.visibility = SEARCH_PLACEHOLDER[tab] ? "" : "hidden";
+  $("search").placeholder = SEARCH_PLACEHOLDER[tab] || "";
+  rerenderActive();
   if (tab === "startup") { loadStartup(); loadAutostart(); }
-  if (tab === "rules") renderRules();
+  if (tab === "services") loadServices();
+  if (tab === "history") loadHistory();
 }
+
+function rerenderActive() {
+  if (state.tab === "procs") renderTable();
+  else if (state.tab === "startup") renderStartup();
+  else if (state.tab === "services") renderServices();
+  else if (state.tab === "rules") renderRules();
+}
+
+// ---------- services ----------
+const svc = { list: null, filter: "all", sort: "display", busy: new Set() };
+const START_TYPES = [["auto", "Automatic"], ["delayed", "Automatic (delayed)"], ["manual", "Manual"], ["disabled", "Disabled"]];
+
+async function loadServices() {
+  try { svc.list = await invoke("services_list"); }
+  catch (e) { toast(e, true); svc.list = svc.list || []; }
+  renderServices();
+}
+
+function renderServices() {
+  if (!svc.list) { $("svc-empty").hidden = false; return; }
+  const f = state.filter;
+  const rows = svc.list.filter((s) =>
+    (svc.filter === "all" || (svc.filter === "running" ? s.state === "running" : svc.filter === "stopped" ? s.state === "stopped" : !s.windows)) &&
+    (!f || s.display.toLowerCase().includes(f) || s.name.toLowerCase().includes(f) || s.description.toLowerCase().includes(f)));
+  rows.sort(cmp(svc.sort, 1));
+  $("svc-empty").hidden = rows.length > 0;
+  $("svc-empty").textContent = "No services match.";
+  const running = svc.list.filter((s) => s.state === "running").length;
+  $("svc-count").textContent = `${svc.list.length} services · ${running} running`;
+
+  document.querySelector("#services tbody").innerHTML = rows.map((s) => {
+    const busy = svc.busy.has(s.name);
+    const tag = s.critical ? ` · <span class="crit">critical</span>` : s.windows ? " · Windows" : "";
+    const fixed = s.startType === "boot" || s.startType === "system";
+    const select = fixed
+      ? `<span class="hint-line">${s.startType === "boot" ? "Boot" : "System"}</span>`
+      : `<select data-start="${esc(s.name)}">${START_TYPES.map(([v, l]) => `<option value="${v}"${v === s.startType ? " selected" : ""}>${l}</option>`).join("")}</select>`;
+    const act = busy ? ""
+      : s.state === "running" ? (s.canStop ? `<button class="btn small" data-act="restart">Restart</button> <button class="btn small danger" data-act="stop">Stop</button>` : "")
+      : s.state === "stopped" ? `<button class="btn small primary" data-act="start">Start</button>` : "";
+    return `<tr data-name="${esc(s.name)}" class="${busy ? "busy" : ""}">` +
+      `<td title="${esc(s.path)}"><div class="svc-name">${esc(s.display)}</div><div class="svc-id">${esc(s.name)}${tag}</div></td>` +
+      `<td class="col-state"><span class="state ${busy ? "working" : s.state}">${busy ? "working…" : s.state}</span></td>` +
+      `<td class="col-start">${select}</td>` +
+      `<td class="num narrow">${s.pid ? `<a data-pid="${s.pid}">${s.pid}</a>` : ""}</td>` +
+      `<td class="desc" title="${esc(s.description)}">${esc(s.description)}</td>` +
+      `<td class="col-act">${act}</td></tr>`;
+  }).join("");
+}
+
+// Stopping or disabling: confirm, with a stronger warning for services Windows depends on.
+function svcWarning(s, what) {
+  if (s.critical) return [`${what} a critical Windows service?`,
+    `Windows needs "${s.display}" (${s.name}) to work properly. ${what === "Disable" ? "Disabling" : "Stopping"} it can break sign-in, networking, audio, updates or security until you undo it and restart. Only do this if you know exactly why.`,
+    `${what} anyway`];
+  if (s.windows) return [`${what} "${s.display}"?`,
+    `This is a built-in Windows service. ${what === "Disable" ? "You can set it back to Automatic or Manual later." : "You can start it again any time, or restart the PC."}`, what];
+  return [`${what} "${s.display}"?`, `${s.description || s.path}`, what];
+}
+
+async function serviceAction(s, action) {
+  if (action !== "start") {
+    const [t, b, y] = svcWarning(s, action === "stop" ? "Stop" : "Restart");
+    if (!(await confirmBox(t, b, y))) return;
+  }
+  svc.busy.add(s.name);
+  renderServices();
+  try {
+    await invoke("service_control", { name: s.name, action });
+    toast(`${s.display}: ${action === "stop" ? "stopped" : action === "start" ? "started" : "restarted"}`);
+  } catch (e) { toast(e, true); }
+  svc.busy.delete(s.name);
+  await loadServices();
+}
+
+document.querySelector("#services tbody").addEventListener("click", (e) => {
+  const tr = e.target.closest("tr");
+  const s = tr && svc.list.find((x) => x.name === tr.dataset.name);
+  if (!s) return;
+  const act = e.target.closest("[data-act]");
+  if (act) return serviceAction(s, act.dataset.act);
+  const pid = e.target.closest("[data-pid]");
+  if (pid) { setTab("procs"); select({ pid: +pid.dataset.pid }); }
+});
+
+document.querySelector("#services tbody").addEventListener("change", async (e) => {
+  const sel = e.target.closest("select[data-start]");
+  if (!sel) return;
+  const s = svc.list.find((x) => x.name === sel.dataset.start);
+  const startType = sel.value;
+  if (startType === "disabled" || s.critical) {
+    const [t, b, y] = startType === "disabled" ? svcWarning(s, "Disable")
+      : [`Change startup of "${s.display}"?`, `Windows needs this service. Changing how it starts can cause problems after the next restart.`, "Change"];
+    if (!(await confirmBox(t, b, y))) { sel.value = s.startType; return; }
+  }
+  try {
+    await invoke("service_set_start", { name: s.name, startType });
+    toast(`${s.display}: startup set to ${START_TYPES.find(([v]) => v === startType)[1]}`);
+  } catch (err) { toast(err, true); }
+  loadServices();
+});
+
+$("svc-filter").addEventListener("click", (e) => {
+  const f = e.target.dataset.f;
+  if (!f) return;
+  svc.filter = f;
+  document.querySelectorAll("#svc-filter button").forEach((b) => b.classList.toggle("on", b.dataset.f === f));
+  renderServices();
+});
+document.querySelector("#services thead").addEventListener("click", (e) => {
+  const k = e.target.closest("th")?.dataset.ssort;
+  if (k) { svc.sort = k; renderServices(); }
+});
+
+// ---------- history ----------
+const HIST_KEEP = 30 * 60;
+const H_METRICS = {
+  cpu: { color: () => COLORS.cpu, max: 100, fmt: (v) => `${v.toFixed(0)}%` },
+  mem: { color: () => COLORS.mem, max: 100, fmt: (v) => `${v.toFixed(0)}%` },
+  gpu: { color: () => COLORS.gpu, max: 100, fmt: (v) => `${v.toFixed(0)}%` },
+  disk: { color: () => COLORS.disk, max: null, fmt: fmtRate },
+  net: { color: () => COLORS.net, max: null, fmt: fmtRate },
+};
+const hv = { points: [], lastT: 0, range: 10, cursor: null, pinned: false, moment: null, momentT: null };
+
+async function loadHistory() {
+  try {
+    const pts = await invoke("history_since", { t: hv.lastT });
+    if (pts.length) {
+      hv.points.push(...pts);
+      if (hv.points.length > HIST_KEEP) hv.points.splice(0, hv.points.length - HIST_KEEP);
+      hv.lastT = hv.points[hv.points.length - 1].t;
+    }
+  } catch (e) { toast(e, true); }
+  renderHistory();
+  if (!hv.pinned && hv.cursor == null) fetchMoment(hv.lastT);
+}
+
+function visiblePoints() {
+  const end = hv.lastT, start = end - hv.range * 60_000;
+  return { pts: hv.points.filter((p) => p.t >= start), start, end };
+}
+
+function drawHistChart(canvas, pts, key, start, end) {
+  const m = H_METRICS[key];
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (!w) return;
+  if (canvas.width !== w * dpr || canvas.height !== h * dpr) { canvas.width = w * dpr; canvas.height = h * dpr; }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const top = m.max ?? Math.max(1024, ...pts.map((p) => p[key])) * 1.15;
+  const x = (t) => ((t - start) / Math.max(1, end - start)) * w;
+  const y = (v) => h - (v / top) * (h - 4) - 2;
+  const color = m.color();
+  if (pts.length > 1) {
+    ctx.beginPath();
+    pts.forEach((p, i) => (i ? ctx.lineTo(x(p.t), y(p[key])) : ctx.moveTo(x(p.t), y(p[key]))));
+    ctx.lineTo(x(pts[pts.length - 1].t), h); ctx.lineTo(x(pts[0].t), h); ctx.closePath();
+    const g = ctx.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, color + "55"); g.addColorStop(1, color + "05");
+    ctx.fillStyle = g; ctx.fill();
+    ctx.beginPath();
+    pts.forEach((p, i) => (i ? ctx.lineTo(x(p.t), y(p[key])) : ctx.moveTo(x(p.t), y(p[key]))));
+    ctx.strokeStyle = color; ctx.lineWidth = 1.25; ctx.lineJoin = "round"; ctx.stroke();
+  }
+  if (hv.cursor != null) {
+    const cx = Math.round(x(hv.cursor)) + 0.5;
+    ctx.strokeStyle = hv.pinned ? "#ffffffcc" : "#ffffff66";
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, h); ctx.stroke();
+  }
+}
+
+const nearest = (pts, t) => pts.reduce((best, p) => (!best || Math.abs(p.t - t) < Math.abs(best.t - t) ? p : best), null);
+const clock = (t) => new Date(t).toLocaleTimeString();
+const ago = (t) => { const s = Math.round((hv.lastT - t) / 1000); return s < 5 ? "just now" : s < 60 ? `${s}s ago` : `${Math.floor(s / 60)}m ${s % 60}s ago`; };
+
+function renderHistory() {
+  if (state.tab !== "history") return;
+  const { pts, start, end } = visiblePoints();
+  const at = hv.cursor != null ? nearest(pts, hv.cursor) : pts[pts.length - 1];
+  document.querySelectorAll(".hist-row").forEach((row) => {
+    const k = row.dataset.k;
+    drawHistChart(row.querySelector("canvas"), pts, k, start, end);
+    row.querySelector(".hist-val").textContent = at ? H_METRICS[k].fmt(at[k]) : "–";
+  });
+  const span = hv.range * 60_000;
+  $("hist-axis").innerHTML = [0, 0.25, 0.5, 0.75, 1].map((f) => `<span>${f === 1 ? "now" : `-${Math.round(((1 - f) * span) / 60_000)}m`}</span>`).join("");
+  $("hist-live").hidden = !hv.pinned;
+  $("hist-hint").textContent = pts.length < 2 ? "Collecting… history builds up while Overseer runs."
+    : hv.pinned ? `Pinned at ${clock(hv.cursor)}` : "Hover the charts to look back; click to pin a moment.";
+
+  // Biggest CPU spikes: highest points at least 30s apart.
+  const spikes = [];
+  for (const p of [...pts].sort((a, b) => b.cpu - a.cpu)) {
+    if (p.cpu < 15 || spikes.length >= 5) break;
+    if (spikes.every((s) => Math.abs(s.t - p.t) > 30_000)) spikes.push(p);
+  }
+  $("hist-spikes").innerHTML = spikes.length
+    ? spikes.map((s) => `<div class="spike" data-t="${s.t}"><time>${clock(s.t)}</time><b>${s.cpu.toFixed(0)}%</b><span>top: ${esc(s.top)} (${s.topCpu.toFixed(0)}%) · ${ago(s.t)}</span></div>`).join("")
+    : `<div class="hint-line">No CPU spikes over 15% in this window.</div>`;
+
+  renderMoment();
+}
+
+let momentTimer;
+function fetchMoment(t, delay = 0) {
+  clearTimeout(momentTimer);
+  momentTimer = setTimeout(async () => {
+    try {
+      hv.moment = await invoke("history_moment", { t });
+      hv.momentT = t;
+      renderMoment();
+    } catch (e) { /* history may be empty */ }
+  }, delay);
+}
+
+function renderMoment() {
+  const m = hv.moment;
+  $("hist-at").textContent = hv.cursor == null ? "Now" : clock(m?.t ?? hv.cursor);
+  $("hist-ago").textContent = m ? `Top processes · ${ago(m.t)}` : "Top processes at this moment";
+  const procs = m ? [...m.procs].sort((a, b) => b.cpu - a.cpu).slice(0, 18) : [];
+  document.querySelector("#hist-procs tbody").innerHTML = procs.map((p) =>
+    `<tr data-pid="${p.pid}" title="${esc(p.name)} (PID ${p.pid}) · disk ${fmtRate(p.disk)} · net ${fmtRate(p.net)}">` +
+      `<td>${esc(p.name)}</td><td class="num">${fmtPct(p.cpu)}</td><td class="num">${p.gpu < 0.5 ? "–" : p.gpu.toFixed(0) + "%"}</td><td class="num">${fmtBytes(p.mem)}</td></tr>`).join("");
+}
+
+function cursorFromEvent(e) {
+  const canvas = e.target.closest(".hist-row")?.querySelector("canvas");
+  if (!canvas) return null;
+  const r = canvas.getBoundingClientRect();
+  const { start, end } = visiblePoints();
+  const f = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+  return start + f * (end - start);
+}
+
+$("hist-charts").addEventListener("mousemove", (e) => {
+  if (hv.pinned) return;
+  const t = cursorFromEvent(e);
+  if (t == null) return;
+  hv.cursor = t;
+  renderHistory();
+  fetchMoment(t, 120);
+});
+$("hist-charts").addEventListener("mouseleave", () => {
+  if (hv.pinned) return;
+  hv.cursor = null;
+  renderHistory();
+  fetchMoment(hv.lastT);
+});
+$("hist-charts").addEventListener("click", (e) => {
+  const t = cursorFromEvent(e);
+  if (t == null) return;
+  hv.pinned = true;
+  hv.cursor = t;
+  renderHistory();
+  fetchMoment(t);
+});
+$("hist-live").addEventListener("click", () => {
+  hv.pinned = false;
+  hv.cursor = null;
+  renderHistory();
+  fetchMoment(hv.lastT);
+});
+$("hist-spikes").addEventListener("click", (e) => {
+  const s = e.target.closest("[data-t]");
+  if (!s) return;
+  hv.pinned = true;
+  hv.cursor = +s.dataset.t;
+  renderHistory();
+  fetchMoment(hv.cursor);
+});
+$("hist-range").addEventListener("click", (e) => {
+  const r = +e.target.dataset.r;
+  if (!r) return;
+  hv.range = r;
+  document.querySelectorAll("#hist-range button").forEach((b) => b.classList.toggle("on", +b.dataset.r === r));
+  renderHistory();
+});
+document.querySelector("#hist-procs tbody").addEventListener("click", (e) => {
+  const tr = e.target.closest("tr[data-pid]");
+  if (!tr) return;
+  const pid = +tr.dataset.pid;
+  if (!state.snap?.procs.some((p) => p.pid === pid)) return toast("That process has exited since then.");
+  setTab("procs");
+  select({ pid });
+});
 
 // ---------- startup apps ----------
 async function loadStartup() {
@@ -552,7 +912,7 @@ $("d-props").addEventListener("click", (e) => {
 
 $("search").addEventListener("input", (e) => {
   state.filter = e.target.value.trim().toLowerCase();
-  state.tab === "startup" ? renderStartup() : renderTable();
+  rerenderActive();
 });
 $("modes").addEventListener("click", (e) => { const m = e.target.dataset.mode; if (m) setMode(m); });
 $("pause").addEventListener("click", togglePause);
@@ -584,12 +944,12 @@ function togglePause() {
 
 document.addEventListener("keydown", (e) => {
   if (!$("modal").hidden) return;
-  if (e.ctrlKey && ["1", "2", "3"].includes(e.key)) { e.preventDefault(); setTab(["procs", "startup", "rules"][+e.key - 1]); return; }
+  if (e.ctrlKey && /^[1-5]$/.test(e.key)) { e.preventDefault(); setTab(TABS[+e.key - 1]); return; }
   if (e.target.matches("input:not(#search), select")) return; // typing in the rules form
   const typing = e.target === $("search");
   if ((e.key === "/" && !typing) || (e.key === "f" && e.ctrlKey)) { e.preventDefault(); $("search").focus(); $("search").select(); return; }
   if (e.key === "Escape") {
-    if (typing && state.filter) { $("search").value = ""; state.filter = ""; state.tab === "startup" ? renderStartup() : renderTable(); }
+    if (typing && state.filter) { $("search").value = ""; state.filter = ""; rerenderActive(); }
     else if (typing) $("search").blur();
     else select(null);
     return;
@@ -630,6 +990,10 @@ async function tick(force = false) {
     } else if (state.tab === "rules") {
       await loadRules();
       renderRules();
+    } else if (state.tab === "history") {
+      await loadHistory();
+    } else if (state.tab === "services" && ++tickCount % 5 === 0 && !svc.busy.size) {
+      loadServices();
     }
   } catch (e) {
     toast(e, true);
@@ -644,7 +1008,8 @@ async function tick(force = false) {
     $("sysline").textContent = `${info.host} · ${info.cpuBrand} · ${info.cores} threads`;
     $("sysline").title = info.os;
     const b = $("admin");
-    b.textContent = info.admin ? "● Admin" : "● Limited, click to elevate";
+    b.textContent = info.admin ? "● Admin" : "● Limited";
+    b.title = info.admin ? "Running as administrator" : "Click to restart as administrator (needed for bandwidth, services and system processes)";
     b.className = "badge " + (info.admin ? "admin" : "limited");
     $("s-hotkey").textContent = `${info.hotkey} shows/hides Overseer`;
   } catch (e) { toast(e, true); }
@@ -680,8 +1045,25 @@ function mockInvoke(cmd, args) {
       p.base = Math.random() ** 3 * 8; p.memBase = Math.random() ** 2 * 6e8 + 4e6;
       p.conns = /chrome|Discord|Spotify|Teams|steam/.test(p.name) ? Math.floor(Math.random() * 30) : 0;
       p.listening = p.name === "svchost.exe" && Math.random() > 0.7 ? 1 : 0;
+      p.gpuBase = /chrome|Code|Discord|dwm|steam/.test(p.name) ? Math.random() * 25 : 0;
+      p.sig = /cargo|node/.test(p.name) ? "unsigned" : p.name === "Spotify.exe" ? "invalid" : "valid";
+      p.signer = p.sig === "valid" ? (/svchost|lsass|csrss|explorer|dwm|services|wininit|smss|Runtime|Search|System|Registry|audiodg|MsMpEng/.test(p.name) ? "Microsoft Windows" : `${p.name.replace(".exe", "")} Inc.`) : null;
     });
-    return { procs, t: 0 };
+    const states = ["running", "stopped"];
+    const mockServices = [
+      ["AudioSrv", "Windows Audio", "Manages audio for Windows-based programs.", true, true],
+      ["BITS", "Background Intelligent Transfer Service", "Transfers files in the background using idle network bandwidth.", true, false],
+      ["Dnscache", "DNS Client", "Caches Domain Name System (DNS) names.", true, true],
+      ["Spooler", "Print Spooler", "Spools print jobs and handles interaction with the printer.", true, false],
+      ["SteamClientService", "Steam Client Service", "Steam Client Service monitors and updates Steam content.", false, false],
+      ["NVDisplay.ContainerLocalSystem", "NVIDIA Display Container LS", "Container service for NVIDIA root features.", false, false],
+      ["WSearch", "Windows Search", "Provides content indexing, property caching, and search results.", true, false],
+      ["wuauserv", "Windows Update", "Enables the detection, download, and installation of updates.", true, false],
+    ].map(([name, display, description, windows, critical], i) => ({
+      name, display, description, windows, critical, state: states[i % 3 === 1 ? 1 : 0], startType: ["auto", "manual", "delayed", "disabled"][i % 4],
+      pid: i % 3 === 1 ? 0 : 1000 + i * 4, path: windows ? "C:\\Windows\\system32\\svchost.exe -k netsvcs" : `"C:\\Program Files\\${display}\\service.exe"`, account: "LocalSystem", canStop: true,
+    }));
+    return { procs, t: 0, services: mockServices, hist: [] };
   })());
   m.t++;
   const wave = (k) => Math.max(0, Math.sin(m.t / 6 + k) * 0.5 + Math.random() * 0.8);
@@ -693,9 +1075,19 @@ function mockInvoke(cmd, args) {
   if (cmd === "set_autostart") return Promise.resolve((m.autostart = { ...m.autostart, enabled: args.enabled, elevated: args.enabled && args.elevated }));
   if (cmd === "snapshot") {
     const procs = m.procs.map((p, i) => ({ pid: p.pid, parent: p.parent, name: p.name, conns: p.conns, listening: p.listening,
+      gpu: p.gpuBase * wave(i + 3), gpuMem: p.gpuBase ? p.gpuBase * 1e7 : 0, sig: p.sig, signer: p.signer,
       netRx: p.conns ? Math.random() * p.conns * 4e4 : 0, netTx: p.conns ? Math.random() * p.conns * 6e3 : 0, cpu: p.base * wave(i), mem: p.memBase * (0.9 + Math.random() * 0.2), diskRead: Math.random() > 0.85 ? Math.random() * 3e6 : 0, diskWrite: Math.random() > 0.9 ? Math.random() * 1e6 : 0 }));
     const cpu = Math.min(100, procs.reduce((a, p) => a + p.cpu, 0));
+    const gpu = Math.min(100, procs.reduce((a, p) => Math.max(a, p.gpu), 0) * 1.4);
+    // Record mock history (one point per call), seeded with 10 minutes on first call.
+    const mkPoint = (t, c) => {
+      const top = procs.reduce((a, p) => (p.cpu > a.cpu ? p : a), procs[0]);
+      return { t, cpu: c, mem: 47 + Math.random() * 3, gpu: gpu * Math.random(), disk: Math.random() * 2e7, net: Math.random() * 3e6, top: top.name, topCpu: top.cpu };
+    };
+    if (!m.hist.length) for (let i = 600; i > 0; i--) m.hist.push(mkPoint(Date.now() - i * 1000, Math.min(100, 20 + 15 * Math.sin(i / 40) + Math.random() * 10 + (i % 170 === 0 ? 60 : 0))));
+    m.hist.push(mkPoint(Date.now(), cpu));
     return Promise.resolve({
+      gpu, gpuMem: 1.4e9,
       cpu, cores: Array.from({ length: 16 }, () => Math.min(100, cpu * (0.4 + Math.random() * 1.2))),
       memUsed: procs.reduce((a, p) => a + p.mem, 0) + 4e9, memTotal: 32 * 1024 ** 3, swapUsed: 1.2e9, swapTotal: 8e9,
       netRx: Math.random() * 4e6 * wave(1), netTx: Math.random() * 6e5, diskRead: procs.reduce((a, p) => a + p.diskRead, 0), diskWrite: procs.reduce((a, p) => a + p.diskWrite, 0),
@@ -707,7 +1099,20 @@ function mockInvoke(cmd, args) {
     return Promise.resolve({ pid: p.pid, name: p.name, exe: `C:\\Program Files\\${p.name.replace(".exe", "")}\\${p.name}`, cmd: `"${p.name}" --type=renderer`, cwd: "C:\\Users\\you", parent: par?.pid ?? null, parentName: par?.name, status: "Run", startTime: Date.now() / 1000 - 5000, runTime: 5000, virt: 2.1e9, priority: "normal" });
   }
   if (cmd === "kill") return Promise.resolve(args.pids.length);
-  if (cmd === "set_priority" || cmd === "set_startup") return Promise.resolve();
+  if (cmd === "set_priority" || cmd === "set_startup" || cmd === "open_virustotal") return Promise.resolve();
+  if (cmd === "services_list") return Promise.resolve(m.services.map((s) => ({ ...s })));
+  if (cmd === "service_control") {
+    const s = m.services.find((x) => x.name === args.name);
+    s.state = args.action === "stop" ? "stopped" : "running";
+    return new Promise((r) => setTimeout(r, 600));
+  }
+  if (cmd === "service_set_start") { m.services.find((x) => x.name === args.name).startType = args.startType; return Promise.resolve(); }
+  if (cmd === "history_since") return Promise.resolve(m.hist.filter((p) => p.t > args.t));
+  if (cmd === "history_moment") {
+    const p = m.hist.reduce((a, b) => (Math.abs(b.t - args.t) < Math.abs(a.t - args.t) ? b : a));
+    return Promise.resolve({ t: p.t, procs: m.procs.slice(0, 14).map((x, i) => ({ pid: x.pid, name: x.name, cpu: (p.cpu / (i + 2)), gpu: x.gpuBase, mem: x.memBase, disk: 0, net: 0 })) });
+  }
+  if (cmd === "file_hash") return Promise.resolve({ path: "C:\\mock\\file.exe", sha256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" });
   if (cmd === "connections") {
     const n = m.procs.find((x) => x.pid === args.pid)?.conns || 0;
     return Promise.resolve([

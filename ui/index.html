@@ -18,8 +18,10 @@
 
     <nav class="tabs" id="tabs">
       <button data-tab="procs" class="on" title="Ctrl+1">Processes</button>
-      <button data-tab="startup" title="Ctrl+2">Startup</button>
-      <button data-tab="rules" title="Ctrl+3">Rules <span class="pill" id="rules-count" hidden></span></button>
+      <button data-tab="history" title="Ctrl+2">History</button>
+      <button data-tab="services" title="Ctrl+3">Services</button>
+      <button data-tab="startup" title="Ctrl+4">Startup</button>
+      <button data-tab="rules" title="Ctrl+5">Rules <span class="pill" id="rules-count" hidden></span></button>
     </nav>
 
     <div class="search">
@@ -49,6 +51,11 @@
       <canvas id="c-mem"></canvas>
       <div class="card-sub" id="m-mem-sub">–</div>
     </div>
+    <div class="card" data-k="gpu">
+      <div class="card-head"><span>GPU</span><b id="m-gpu">–</b></div>
+      <canvas id="c-gpu"></canvas>
+      <div class="card-sub" id="m-gpu-sub">–</div>
+    </div>
     <div class="card" data-k="disk">
       <div class="card-head"><span>Disk I/O</span><b id="m-disk">–</b></div>
       <canvas id="c-disk"></canvas>
@@ -69,6 +76,7 @@
             <th data-sort="name" class="col-name">Name</th>
             <th data-sort="pid" class="num">PID</th>
             <th data-sort="cpu" class="num">CPU</th>
+            <th data-sort="gpu" class="num narrow">GPU</th>
             <th data-sort="mem" class="num">Memory</th>
             <th data-sort="diskRead" class="num">Disk read</th>
             <th data-sort="diskWrite" class="num">Disk write</th>
@@ -91,10 +99,19 @@
       <div class="live">
         <div><span>CPU</span><b id="d-cpu">–</b></div>
         <div><span>Memory</span><b id="d-mem">–</b></div>
+        <div><span>GPU</span><b id="d-gpu">–</b></div>
         <div><span>Disk</span><b id="d-disk">–</b></div>
-        <div><span>Network</span><b id="d-net">–</b></div>
+        <div class="wide"><span>Network</span><b id="d-net">–</b></div>
       </div>
       <dl id="d-props"></dl>
+      <div class="sigbox" id="d-sig">
+        <div class="sig-status" id="d-sig-status"></div>
+        <code class="hash" id="d-hash" hidden></code>
+        <div class="actions">
+          <button class="btn" id="d-hash-btn">Get SHA-256</button>
+          <button class="btn" id="d-vt" hidden title="Opens virustotal.com in your browser with this file's hash. Nothing is uploaded.">Look up on VirusTotal ↗</button>
+        </div>
+      </div>
       <label class="field" id="d-prio-wrap">
         <span>Priority</span>
         <select id="d-prio">
@@ -116,6 +133,69 @@
         <div id="d-conns"></div>
       </div>
     </aside>
+  </main>
+
+  <main class="body" id="view-history" hidden>
+    <div class="hist-main">
+      <div class="toolbar">
+        <div class="segmented" id="hist-range">
+          <button data-r="5">5 min</button>
+          <button data-r="10" class="on">10 min</button>
+          <button data-r="30">30 min</button>
+        </div>
+        <span class="hint-line" id="hist-hint">Hover the charts to look back; click to pin a moment.</span>
+        <button class="link" id="hist-live" hidden>Back to live</button>
+      </div>
+      <div class="hist-charts" id="hist-charts">
+        <div class="hist-row" data-k="cpu"><span class="hist-label">CPU</span><canvas></canvas><b class="hist-val"></b></div>
+        <div class="hist-row" data-k="mem"><span class="hist-label">Memory</span><canvas></canvas><b class="hist-val"></b></div>
+        <div class="hist-row" data-k="gpu"><span class="hist-label">GPU</span><canvas></canvas><b class="hist-val"></b></div>
+        <div class="hist-row" data-k="disk"><span class="hist-label">Disk</span><canvas></canvas><b class="hist-val"></b></div>
+        <div class="hist-row" data-k="net"><span class="hist-label">Network</span><canvas></canvas><b class="hist-val"></b></div>
+        <div class="hist-axis" id="hist-axis"></div>
+      </div>
+      <div class="section-title">Biggest CPU spikes</div>
+      <div id="hist-spikes"></div>
+    </div>
+    <aside class="panel" id="hist-panel">
+      <div>
+        <div class="panel-title" id="hist-at">Now</div>
+        <div class="panel-sub" id="hist-ago">Top processes at this moment</div>
+      </div>
+      <table class="mini" id="hist-procs">
+        <thead><tr><th>Process</th><th class="num">CPU</th><th class="num">GPU</th><th class="num">Memory</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="hint-line">History covers the last 30 minutes while Overseer is running, including while it sits in the tray.</div>
+    </aside>
+  </main>
+
+  <main class="body single column" id="view-services" hidden>
+    <div class="toolbar">
+      <div class="segmented" id="svc-filter">
+        <button data-f="all" class="on">All</button>
+        <button data-f="running">Running</button>
+        <button data-f="stopped">Stopped</button>
+        <button data-f="third" title="Services that don't ship with Windows">Non-Windows</button>
+      </div>
+      <span class="hint-line" id="svc-count"></span>
+    </div>
+    <div class="table-wrap">
+      <table id="services">
+        <thead>
+          <tr>
+            <th data-ssort="display">Name</th>
+            <th data-ssort="state" class="col-state">Status</th>
+            <th data-ssort="startType" class="col-start">Startup type</th>
+            <th data-ssort="pid" class="num narrow">PID</th>
+            <th>Description</th>
+            <th class="col-act"></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div class="empty" id="svc-empty" hidden>Loading services…</div>
+    </div>
   </main>
 
   <main class="body single column" id="view-startup" hidden>
@@ -188,8 +268,9 @@
     <span id="s-count">–</span>
     <span id="s-uptime">–</span>
     <span id="s-bw">–</span>
+    <button class="chip" id="s-unsigned" hidden></button>
     <span id="s-hotkey"></span>
-    <span class="hint">/ search · 1 2 3 views · Space pause · Del end task · Esc clear</span>
+    <span class="hint">Ctrl+1–5 tabs · / search · 1 2 3 views · Space pause · Del end task · Esc clear</span>
   </footer>
 
   <div class="modal" id="modal" hidden>

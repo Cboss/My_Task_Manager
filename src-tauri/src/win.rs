@@ -76,6 +76,15 @@ pub fn reveal_in_explorer(path: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+pub fn open_url(url: &str) -> Result<(), String> {
+    let verb = wide(OsStr::new("open"));
+    let target = wide(OsStr::new(url));
+    let r = unsafe {
+        ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), target.as_ptr(), std::ptr::null(), std::ptr::null(), 1)
+    };
+    if (r as isize) > 32 { Ok(()) } else { Err("Couldn't open your browser".into()) }
+}
+
 pub const WAIT_FLAG: &str = "--wait-for";
 
 /// If launched with `--wait-for <pid>`, block (up to 10s) until that process exits.

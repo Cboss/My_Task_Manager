@@ -2543,11 +2543,12 @@ dependencies = [
 
 [[package]]
 name = "overseer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ferrisetw",
  "serde",
  "serde_json",
+ "sha2",
  "sysinfo",
  "tauri",
  "tauri-build",

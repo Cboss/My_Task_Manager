@@ -3,8 +3,12 @@
 
 mod autostart;
 mod etw;
+mod gpu;
+mod history;
 mod net;
 mod rules;
+mod services;
+mod sig;
 mod startup;
 mod win;
 
@@ -38,6 +42,9 @@ struct Shared {
     bandwidth: etw::Counters,
     bandwidth_on: bool,
     rules: Arc<Mutex<rules::Engine>>,
+    history: Arc<Mutex<history::History>>,
+    sigs: sig::Cache,
+    sig_wanted: sig::Wanted,
 }
 
 /// Works whether sysinfo hands back `&str`/`String` or `&OsStr`/`OsString`.
@@ -57,13 +64,19 @@ pub struct Proc {
     disk_write: f64,
     net_rx: f64,
     net_tx: f64,
+    gpu: f32,
+    gpu_mem: u64,
     conns: u32,
     listening: u32,
+    sig: Option<&'static str>,
+    signer: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct Snapshot {
+pub struct Snapshot {
+    gpu: f32,
+    gpu_mem: u64,
     cpu: f32,
     cores: Vec<f32>,
     mem_used: u64,
@@ -105,6 +118,7 @@ struct Details {
     run_time: u64,
     virt: u64,
     priority: Option<&'static str>,
+    sig: Option<sig::Sig>,
 }
 
 /// Parent PID, but only if that parent is genuinely older than the child.
@@ -115,7 +129,7 @@ fn real_parent(sys: &System, p: &sysinfo::Process) -> Option<Pid> {
     (parent.start_time() <= p.start_time()).then_some(pp)
 }
 
-fn sample(m: &mut Monitor, bandwidth: Option<&etw::Counters>) -> Snapshot {
+fn sample(m: &mut Monitor, bandwidth: Option<&etw::Counters>, gpu: &gpu::Sample, sigs: &sig::Cache, wanted: &sig::Wanted) -> Snapshot {
     m.sys.refresh_all();
     m.nets.refresh();
 
@@ -136,6 +150,8 @@ fn sample(m: &mut Monitor, bandwidth: Option<&etw::Counters>) -> Snapshot {
         .and_then(|b| b.lock().ok().map(|mut map| map.drain().collect()))
         .unwrap_or_default();
     let conns = net::counts();
+    let sig_cache = sigs.lock().ok();
+    let mut unknown_exes = Vec::new();
 
     let procs: Vec<Proc> = sys
         .processes()
@@ -146,7 +162,23 @@ fn sample(m: &mut Monitor, bandwidth: Option<&etw::Counters>) -> Snapshot {
             let d = p.disk_usage();
             let c = conns.get(&pid).copied().unwrap_or_default();
             let (brx, btx) = bytes.get(&pid).copied().unwrap_or_default();
+            let (gpu_util, gpu_mem) = gpu.per_pid.get(&pid).copied().unwrap_or_default();
+            let exe = p.exe().map(|e| e.display().to_string());
+            let sig = match (&exe, &sig_cache) {
+                (Some(path), Some(cache)) => match cache.get(path) {
+                    Some(s) => Some(s.clone()),
+                    None => {
+                        unknown_exes.push(path.clone());
+                        None
+                    }
+                },
+                _ => None,
+            };
             Proc {
+                gpu: gpu_util,
+                gpu_mem,
+                sig: sig.as_ref().map(|s| s.status),
+                signer: sig.and_then(|s| s.signer),
                 pid,
                 parent: real_parent(sys, p).map(|x| x.as_u32()),
                 name: lossy(p.name()),
@@ -162,7 +194,16 @@ fn sample(m: &mut Monitor, bandwidth: Option<&etw::Counters>) -> Snapshot {
         })
         .collect();
 
+    drop(sig_cache);
+    if !unknown_exes.is_empty() {
+        if let Ok(mut w) = wanted.lock() {
+            w.extend(unknown_exes);
+        }
+    }
+
     Snapshot {
+        gpu: gpu.total,
+        gpu_mem: gpu.dedicated,
         cpu: sys.global_cpu_usage(),
         cores: sys.cpus().iter().map(|c| c.cpu_usage()).collect(),
         mem_used: sys.used_memory(),
@@ -186,11 +227,20 @@ fn can_kill(pid: u32) -> bool {
 /// Background loop: sample once a second, run rules, publish for the UI.
 /// Runs whether or not the window is visible.
 fn sampler(app: AppHandle, shared: Shared) {
+    // PDH handles aren't Send, so the GPU query lives on this thread.
+    let mut gpu = gpu::Gpu::new();
     loop {
         let started = Instant::now();
+        let gpu_sample = gpu.as_mut().map(|g| g.sample()).unwrap_or_default();
         let snap = {
             let mut m = shared.monitor.lock().unwrap();
-            let snap = sample(&mut m, shared.bandwidth_on.then_some(&shared.bandwidth));
+            let snap = sample(
+                &mut m,
+                shared.bandwidth_on.then_some(&shared.bandwidth),
+                &gpu_sample,
+                &shared.sigs,
+                &shared.sig_wanted,
+            );
             let sys = &m.sys;
             let kill = |pid: u32| can_kill(pid) && sys.process(Pid::from_u32(pid)).is_some_and(|p| p.kill());
             shared.rules.lock().unwrap().run(&snap.procs, &app, &kill);
@@ -200,6 +250,11 @@ fn sampler(app: AppHandle, shared: Shared) {
             let mem = snap.mem_used as f64 / snap.mem_total.max(1) as f64 * 100.0;
             let _ = tray.set_tooltip(Some(format!("Overseer · CPU {:.0}% · Memory {:.0}%", snap.cpu, mem)));
         }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        shared.history.lock().unwrap().push(now_ms, &snap);
         *shared.latest.lock().unwrap() = Some(snap);
         std::thread::sleep(SAMPLE_EVERY.saturating_sub(started.elapsed()));
     }
@@ -281,7 +336,11 @@ async fn details(state: State<'_, Shared>, pid: u32) -> Result<Details, String> 
     let m = state.monitor.lock().map_err(|e| e.to_string())?;
     let p = m.sys.process(Pid::from_u32(pid)).ok_or("Process has exited")?;
     let parent = real_parent(&m.sys, p);
+    let sig = p
+        .exe()
+        .and_then(|e| state.sigs.lock().ok()?.get(&e.display().to_string()).cloned());
     Ok(Details {
+        sig,
         pid,
         name: lossy(p.name()),
         exe: p.exe().map(|e| e.display().to_string()),
@@ -387,6 +446,61 @@ fn clear_rule_log(state: State<'_, Shared>) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn services_list() -> Result<Vec<services::Service>, String> {
+    services::list()
+}
+
+#[tauri::command]
+async fn service_control(name: String, action: String) -> Result<(), String> {
+    services::control(&name, &action)
+}
+
+#[tauri::command]
+async fn service_set_start(name: String, start_type: String) -> Result<(), String> {
+    services::set_start_type(&name, &start_type)
+}
+
+#[tauri::command]
+fn history_since(state: State<'_, Shared>, t: u64) -> Result<Vec<history::Point>, String> {
+    Ok(state.history.lock().map_err(|e| e.to_string())?.since(t))
+}
+
+#[tauri::command]
+fn history_moment(state: State<'_, Shared>, t: u64) -> Result<Option<history::Moment>, String> {
+    Ok(state.history.lock().map_err(|e| e.to_string())?.moment(t))
+}
+
+#[derive(Serialize)]
+struct FileHash {
+    path: String,
+    sha256: String,
+}
+
+#[tauri::command]
+async fn file_hash(state: State<'_, Shared>, pid: u32) -> Result<FileHash, String> {
+    let path = {
+        let m = state.monitor.lock().map_err(|e| e.to_string())?;
+        m.sys
+            .process(Pid::from_u32(pid))
+            .and_then(|p| p.exe())
+            .map(|e| e.display().to_string())
+            .ok_or("Path unavailable (try running as admin)")?
+    };
+    let sha256 = sig::sha256(&path)?;
+    Ok(FileHash { path, sha256 })
+}
+
+/// Opens a VirusTotal report for a SHA-256 in the default browser. Only that URL
+/// shape is allowed, so the page can't be used to open arbitrary links.
+#[tauri::command]
+fn open_virustotal(sha256: String) -> Result<(), String> {
+    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("Not a SHA-256 hash".into());
+    }
+    win::open_url(&format!("https://www.virustotal.com/gui/file/{sha256}"))
+}
+
+#[tauri::command]
 async fn get_autostart() -> Result<autostart::Status, String> {
     autostart::status()
 }
@@ -439,8 +553,12 @@ fn main() {
                 bandwidth,
                 bandwidth_on,
                 rules: Arc::new(Mutex::new(rules::Engine::load(rules_path))),
+                history: Arc::new(Mutex::new(history::History::default())),
+                sigs: sig::Cache::default(),
+                sig_wanted: sig::Wanted::default(),
             };
             app.manage(shared.clone());
+            sig::spawn(shared.sigs.clone(), shared.sig_wanted.clone());
 
             build_tray(app)?;
             if let Err(e) = app.global_shortcut().register(hotkey()) {
@@ -488,6 +606,13 @@ fn main() {
             clear_rule_log,
             get_autostart,
             set_autostart,
+            services_list,
+            service_control,
+            service_set_start,
+            history_since,
+            history_moment,
+            file_hash,
+            open_virustotal,
             restart_as_admin
         ])
         .build(tauri::generate_context!())
