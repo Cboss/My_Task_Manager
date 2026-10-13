@@ -147,7 +147,8 @@ td .count { color: var(--dim); font-size: 11px; margin-left: 6px; font-family: v
 .panel-head { display: flex; justify-content: space-between; gap: 8px; }
 .panel-title { font-size: 16px; font-weight: 700; word-break: break-all; }
 .panel-sub { color: var(--dim); font: 11px var(--mono); }
-.live { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.live { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+#s-bw.off { color: var(--disk); cursor: pointer; }
 .live div { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
 .live span { display: block; color: var(--dim); font-size: 11px; }
 .live b { font: 600 14px var(--mono); }

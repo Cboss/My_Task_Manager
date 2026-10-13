@@ -1,18 +1,27 @@
 // Hide the console window in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod etw;
 mod net;
+mod rules;
 mod startup;
 mod win;
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::sync::Mutex;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use sysinfo::{Networks, Pid, System};
-use tauri::State;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Manager, State};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_notification::NotificationExt;
+
+const SAMPLE_EVERY: Duration = Duration::from_secs(1);
 
 struct Monitor {
     sys: System,
@@ -20,16 +29,24 @@ struct Monitor {
     last: Instant,
 }
 
-struct AppState(Mutex<Monitor>);
+/// Everything the background sampler and the commands share.
+#[derive(Clone)]
+struct Shared {
+    monitor: Arc<Mutex<Monitor>>,
+    latest: Arc<Mutex<Option<Snapshot>>>,
+    bandwidth: etw::Counters,
+    bandwidth_on: bool,
+    rules: Arc<Mutex<rules::Engine>>,
+}
 
 /// Works whether sysinfo hands back `&str`/`String` or `&OsStr`/`OsString`.
 fn lossy<S: AsRef<OsStr> + ?Sized>(s: &S) -> String {
     s.as_ref().to_string_lossy().into_owned()
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct Proc {
+pub struct Proc {
     pid: u32,
     parent: Option<u32>,
     name: String,
@@ -37,11 +54,13 @@ struct Proc {
     mem: u64,
     disk_read: f64,
     disk_write: f64,
+    net_rx: f64,
+    net_tx: f64,
     conns: u32,
     listening: u32,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct Snapshot {
     cpu: f32,
@@ -55,6 +74,7 @@ struct Snapshot {
     disk_read: f64,
     disk_write: f64,
     uptime: u64,
+    bandwidth: bool,
     procs: Vec<Proc>,
 }
 
@@ -66,6 +86,7 @@ struct SysInfo {
     cpu_brand: String,
     cores: usize,
     admin: bool,
+    hotkey: &'static str,
 }
 
 #[derive(Serialize)]
@@ -93,10 +114,7 @@ fn real_parent(sys: &System, p: &sysinfo::Process) -> Option<Pid> {
     (parent.start_time() <= p.start_time()).then_some(pp)
 }
 
-#[tauri::command]
-async fn snapshot(state: State<'_, AppState>) -> Result<Snapshot, String> {
-    let mut guard = state.0.lock().map_err(|e| e.to_string())?;
-    let m = &mut *guard;
+fn sample(m: &mut Monitor, bandwidth: Option<&etw::Counters>) -> Snapshot {
     m.sys.refresh_all();
     m.nets.refresh();
 
@@ -113,32 +131,37 @@ async fn snapshot(state: State<'_, AppState>) -> Result<Snapshot, String> {
         tx += d.transmitted();
     }
 
+    let bytes: HashMap<u32, (u64, u64)> = bandwidth
+        .and_then(|b| b.lock().ok().map(|mut map| map.drain().collect()))
+        .unwrap_or_default();
     let conns = net::counts();
+
     let procs: Vec<Proc> = sys
         .processes()
         .values()
         .filter(|p| p.pid().as_u32() != 0) // "System Idle Process"
         .map(|p| {
+            let pid = p.pid().as_u32();
             let d = p.disk_usage();
-            let c = conns.get(&p.pid().as_u32()).copied().unwrap_or_default();
+            let c = conns.get(&pid).copied().unwrap_or_default();
+            let (brx, btx) = bytes.get(&pid).copied().unwrap_or_default();
             Proc {
-                conns: c.established,
-                listening: c.listening,
-                pid: p.pid().as_u32(),
+                pid,
                 parent: real_parent(sys, p).map(|x| x.as_u32()),
                 name: lossy(p.name()),
                 cpu: p.cpu_usage() / ncpu, // sysinfo is per-core; normalise like Task Manager
                 mem: p.memory(),
                 disk_read: d.read_bytes as f64 / secs,
                 disk_write: d.written_bytes as f64 / secs,
+                net_rx: brx as f64 / secs,
+                net_tx: btx as f64 / secs,
+                conns: c.established,
+                listening: c.listening,
             }
         })
         .collect();
 
-    let disk_read = procs.iter().map(|p| p.disk_read).sum();
-    let disk_write = procs.iter().map(|p| p.disk_write).sum();
-
-    Ok(Snapshot {
+    Snapshot {
         cpu: sys.global_cpu_usage(),
         cores: sys.cpus().iter().map(|c| c.cpu_usage()).collect(),
         mem_used: sys.used_memory(),
@@ -147,28 +170,114 @@ async fn snapshot(state: State<'_, AppState>) -> Result<Snapshot, String> {
         swap_total: sys.total_swap(),
         net_rx: rx as f64 / secs,
         net_tx: tx as f64 / secs,
-        disk_read,
-        disk_write,
+        disk_read: procs.iter().map(|p| p.disk_read).sum(),
+        disk_write: procs.iter().map(|p| p.disk_write).sum(),
         uptime: System::uptime(),
+        bandwidth: bandwidth.is_some(),
         procs,
-    })
+    }
+}
+
+fn can_kill(pid: u32) -> bool {
+    pid > 4 && pid != std::process::id()
+}
+
+/// Background loop: sample once a second, run rules, publish for the UI.
+/// Runs whether or not the window is visible.
+fn sampler(app: AppHandle, shared: Shared) {
+    loop {
+        let started = Instant::now();
+        let snap = {
+            let mut m = shared.monitor.lock().unwrap();
+            let snap = sample(&mut m, shared.bandwidth_on.then_some(&shared.bandwidth));
+            let sys = &m.sys;
+            let kill = |pid: u32| can_kill(pid) && sys.process(Pid::from_u32(pid)).is_some_and(|p| p.kill());
+            shared.rules.lock().unwrap().run(&snap.procs, &app, &kill);
+            snap
+        };
+        if let Some(tray) = app.tray_by_id("main") {
+            let mem = snap.mem_used as f64 / snap.mem_total.max(1) as f64 * 100.0;
+            let _ = tray.set_tooltip(Some(format!("Overseer · CPU {:.0}% · Memory {:.0}%", snap.cpu, mem)));
+        }
+        *shared.latest.lock().unwrap() = Some(snap);
+        std::thread::sleep(SAMPLE_EVERY.saturating_sub(started.elapsed()));
+    }
+}
+
+// ---------- window / tray / hotkey ----------
+
+const HOTKEY_LABEL: &str = "Ctrl+Alt+O";
+
+fn hotkey() -> Shortcut {
+    Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyO)
+}
+
+fn show_main(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+}
+
+fn toggle_main(app: &AppHandle) {
+    let Some(w) = app.get_webview_window("main") else { return };
+    let front = w.is_visible().unwrap_or(false) && !w.is_minimized().unwrap_or(false) && w.is_focused().unwrap_or(false);
+    if front {
+        let _ = w.hide();
+    } else {
+        show_main(app);
+    }
+}
+
+fn build_tray(app: &tauri::App) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, "show", "Show Overseer", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit Overseer", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let mut tray = TrayIconBuilder::with_id("main")
+        .tooltip("Overseer")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_main(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                toggle_main(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    tray.build(app)?;
+    Ok(())
+}
+
+// ---------- commands ----------
+
+#[tauri::command]
+fn snapshot(state: State<'_, Shared>) -> Option<Snapshot> {
+    state.latest.lock().ok()?.clone()
 }
 
 #[tauri::command]
-async fn system_info(state: State<'_, AppState>) -> Result<SysInfo, String> {
-    let m = state.0.lock().map_err(|e| e.to_string())?;
+async fn system_info(state: State<'_, Shared>) -> Result<SysInfo, String> {
+    let m = state.monitor.lock().map_err(|e| e.to_string())?;
     Ok(SysInfo {
         host: System::host_name().unwrap_or_default(),
         os: System::long_os_version().unwrap_or_default(),
         cpu_brand: m.sys.cpus().first().map(|c| c.brand().trim().to_string()).unwrap_or_default(),
         cores: m.sys.cpus().len(),
         admin: win::is_admin(),
+        hotkey: HOTKEY_LABEL,
     })
 }
 
 #[tauri::command]
-async fn details(state: State<'_, AppState>, pid: u32) -> Result<Details, String> {
-    let m = state.0.lock().map_err(|e| e.to_string())?;
+async fn details(state: State<'_, Shared>, pid: u32) -> Result<Details, String> {
+    let m = state.monitor.lock().map_err(|e| e.to_string())?;
     let p = m.sys.process(Pid::from_u32(pid)).ok_or("Process has exited")?;
     let parent = real_parent(&m.sys, p);
     Ok(Details {
@@ -189,10 +298,9 @@ async fn details(state: State<'_, AppState>, pid: u32) -> Result<Details, String
 
 /// Kill one process, or it and all its descendants (children first).
 #[tauri::command]
-async fn kill(state: State<'_, AppState>, pids: Vec<u32>, tree: bool) -> Result<usize, String> {
-    let m = state.0.lock().map_err(|e| e.to_string())?;
-    let me = std::process::id();
-    let mut targets: Vec<u32> = pids.into_iter().filter(|&p| p > 4 && p != me).collect();
+async fn kill(state: State<'_, Shared>, pids: Vec<u32>, tree: bool) -> Result<usize, String> {
+    let m = state.monitor.lock().map_err(|e| e.to_string())?;
+    let mut targets: Vec<u32> = pids.into_iter().filter(|&p| can_kill(p)).collect();
     if targets.is_empty() {
         return Err("Refusing to end a protected process".into());
     }
@@ -208,7 +316,7 @@ async fn kill(state: State<'_, AppState>, pids: Vec<u32>, tree: bool) -> Result<
         while i < targets.len() {
             if let Some(kids) = children.get(&targets[i]) {
                 for &k in kids {
-                    if k != me && !targets.contains(&k) {
+                    if can_kill(k) && !targets.contains(&k) {
                         targets.push(k);
                     }
                 }
@@ -236,8 +344,8 @@ fn set_priority(pid: u32, level: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn open_location(state: State<'_, AppState>, pid: u32) -> Result<(), String> {
-    let m = state.0.lock().map_err(|e| e.to_string())?;
+async fn open_location(state: State<'_, Shared>, pid: u32) -> Result<(), String> {
+    let m = state.monitor.lock().map_err(|e| e.to_string())?;
     let exe = m
         .sys
         .process(Pid::from_u32(pid))
@@ -262,13 +370,23 @@ fn set_startup(scope: String, approved: String, name: String, enabled: bool) -> 
 }
 
 #[tauri::command]
-fn notify(app: tauri::AppHandle, title: String, body: String) -> Result<(), String> {
-    use tauri_plugin_notification::NotificationExt;
-    app.notification().builder().title(title).body(body).show().map_err(|e| e.to_string())
+fn get_rules(state: State<'_, Shared>) -> Result<rules::RulesView, String> {
+    Ok(state.rules.lock().map_err(|e| e.to_string())?.view())
 }
 
 #[tauri::command]
-fn restart_as_admin(app: tauri::AppHandle) -> Result<(), String> {
+fn set_rules(state: State<'_, Shared>, rules: Vec<rules::Rule>) -> Result<(), String> {
+    state.rules.lock().map_err(|e| e.to_string())?.set(rules)
+}
+
+#[tauri::command]
+fn clear_rule_log(state: State<'_, Shared>) -> Result<(), String> {
+    state.rules.lock().map_err(|e| e.to_string())?.clear_log();
+    Ok(())
+}
+
+#[tauri::command]
+fn restart_as_admin(app: AppHandle) -> Result<(), String> {
     win::relaunch_as_admin()?;
     app.exit(0);
     Ok(())
@@ -277,14 +395,62 @@ fn restart_as_admin(app: tauri::AppHandle) -> Result<(), String> {
 fn main() {
     let mut sys = System::new_all();
     sys.refresh_all();
+    let monitor = Arc::new(Mutex::new(Monitor {
+        sys,
+        nets: Networks::new_with_refreshed_list(),
+        last: Instant::now(),
+    }));
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
-        .manage(AppState(Mutex::new(Monitor {
-            sys,
-            nets: Networks::new_with_refreshed_list(),
-            last: Instant::now(),
-        })))
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, shortcut, event| {
+                    if event.state() == ShortcutState::Pressed && *shortcut == hotkey() {
+                        toggle_main(app);
+                    }
+                })
+                .build(),
+        )
+        .setup(move |app| {
+            let bandwidth = etw::Counters::default();
+            let bandwidth_on = win::is_admin() && etw::start(bandwidth.clone()).is_ok();
+            let rules_path = app.path().app_config_dir().ok().map(|d| d.join("rules.json"));
+            let shared = Shared {
+                monitor: monitor.clone(),
+                latest: Arc::new(Mutex::new(None)),
+                bandwidth,
+                bandwidth_on,
+                rules: Arc::new(Mutex::new(rules::Engine::load(rules_path))),
+            };
+            app.manage(shared.clone());
+
+            build_tray(app)?;
+            if let Err(e) = app.global_shortcut().register(hotkey()) {
+                eprintln!("couldn't register {HOTKEY_LABEL}: {e}");
+            }
+
+            let handle = app.handle().clone();
+            std::thread::spawn(move || sampler(handle, shared));
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Closing hides to the tray so rules keep running; quit from the tray menu.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+                static TOLD: AtomicBool = AtomicBool::new(false);
+                if !TOLD.swap(true, Ordering::Relaxed) {
+                    let _ = window
+                        .app_handle()
+                        .notification()
+                        .builder()
+                        .title("Overseer is still running")
+                        .body(format!("Rules keep working in the background. Press {HOTKEY_LABEL} or click the tray icon to reopen; right-click it to quit."))
+                        .show();
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             snapshot,
             system_info,
@@ -295,9 +461,17 @@ fn main() {
             connections,
             startup_items,
             set_startup,
-            notify,
+            get_rules,
+            set_rules,
+            clear_rule_log,
             restart_as_admin
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Overseer");
+        .build(tauri::generate_context!())
+        .expect("error while building Overseer");
+
+    app.run(|_, event| {
+        if let tauri::RunEvent::Exit = event {
+            etw::stop();
+        }
+    });
 }

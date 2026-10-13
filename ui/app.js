@@ -142,9 +142,10 @@ function buildRows(procs) {
     for (const p of procs) {
       if (!matches(p, f)) continue;
       let g = groups.get(p.name);
-      if (!g) groups.set(p.name, (g = { name: p.name, pid: p.pid, pids: [], cpu: 0, mem: 0, diskRead: 0, diskWrite: 0, conns: 0, listening: 0 }));
+      if (!g) groups.set(p.name, (g = { name: p.name, pid: p.pid, pids: [], cpu: 0, mem: 0, diskRead: 0, diskWrite: 0, conns: 0, listening: 0, net: 0, netRx: 0, netTx: 0 }));
       g.pids.push(p.pid); g.cpu += p.cpu; g.mem += p.mem; g.diskRead += p.diskRead; g.diskWrite += p.diskWrite;
       g.conns += p.conns; g.listening += p.listening;
+      g.net += p.net; g.netRx += p.netRx; g.netTx += p.netTx;
       g.pid = Math.min(g.pid, p.pid);
     }
     return [...groups.values()].sort(sorter).map((g) => ({ p: g, depth: 0, group: true }));
@@ -203,6 +204,7 @@ function renderTable() {
         `<td class="num${p.mem > 2e8 ? " hot" : ""}" style="${heat(p.mem, memMax, "167,139,250")}">${fmtBytes(p.mem)}</td>` +
         `<td class="num" style="${heat(p.diskRead, 2e7, "246,173,85")}">${fmtRate(p.diskRead)}</td>` +
         `<td class="num" style="${heat(p.diskWrite, 2e7, "246,173,85")}">${fmtRate(p.diskWrite)}</td>` +
+        `<td class="num${p.net > 1024 ? " hot" : ""}" style="${heat(p.net, 5e6, "99,179,237")}" title="↓ ${fmtRate(p.netRx)} · ↑ ${fmtRate(p.netTx)}">${s.bandwidth ? fmtRate(p.net) : "–"}</td>` +
         `<td class="num narrow${p.conns ? " hot" : ""}" style="${heat(p.conns, 40, "99,179,237")}" title="${p.conns} established · ${p.listening} listening">${p.conns || (p.listening ? "·" : "–")}</td>` +
       `</tr>`
     );
@@ -273,6 +275,7 @@ function renderPanel() {
   $("d-cpu").textContent = fmtPct(sum("cpu"));
   $("d-mem").textContent = fmtBytes(sum("mem"));
   $("d-disk").textContent = fmtRate(sum("diskRead") + sum("diskWrite"));
+  $("d-net").textContent = state.snap.bandwidth ? `↓ ${fmtRate(sum("netRx"))} ↑ ${fmtRate(sum("netTx"))}` : "needs admin";
 
   const d = state.details;
   const props = $("d-props");
@@ -401,16 +404,37 @@ document.querySelector("#startup tbody").addEventListener("click", async (e) => 
   } catch (err) { toast(err, true); }
 });
 
-// ---------- rules ----------
-const RULES_KEY = "overseer.rules.v1";
-const COOLDOWN_MS = 60_000;
-const rules = { list: loadRules(), since: new Map(), fired: new Map(), log: [] };
+// ---------- rules (evaluated by the Rust sampler; this is just the editor) ----------
+const LEGACY_RULES_KEY = "overseer.rules.v1"; // rules lived in localStorage before v0.3
+const rules = { list: [], log: [], lastFired: {} };
 
-function loadRules() {
-  try { return JSON.parse(localStorage.getItem(RULES_KEY)) || []; } catch { return []; }
+async function loadRules() {
+  try {
+    const v = await invoke("get_rules");
+    rules.list = v.rules; rules.log = v.log; rules.lastFired = v.lastFired;
+  } catch (e) { toast(e, true); }
+  updateRulesBadge();
 }
-function saveRules() {
-  try { localStorage.setItem(RULES_KEY, JSON.stringify(rules.list)); } catch {}
+
+async function migrateLegacyRules() {
+  let legacy = null;
+  try { legacy = JSON.parse(localStorage.getItem(LEGACY_RULES_KEY)); } catch {}
+  if (!Array.isArray(legacy) || !legacy.length) return;
+  await loadRules();
+  if (!rules.list.length) await saveRules(legacy);
+  try { localStorage.removeItem(LEGACY_RULES_KEY); } catch {}
+}
+
+async function saveRules(list) {
+  try {
+    await invoke("set_rules", { rules: list });
+    rules.list = list;
+  } catch (e) { toast(e, true); }
+  updateRulesBadge();
+  renderRules();
+}
+
+function updateRulesBadge() {
   const n = rules.list.filter((r) => r.enabled).length;
   $("rules-count").hidden = !n;
   $("rules-count").textContent = n;
@@ -422,7 +446,7 @@ const metricText = (r) => (r.metric === "cpu" ? `${r.threshold}% CPU` : `${r.thr
 function renderRules() {
   $("rules-list").innerHTML = rules.list.length
     ? rules.list.map((r) => {
-        const last = rules.fired.get(r.id);
+        const last = rules.lastFired[r.id];
         return `<div class="rule${r.enabled ? "" : " off"}">` +
           `<button class="switch${r.enabled ? " on" : ""}" data-toggle="${r.id}" title="${r.enabled ? "Pause" : "Resume"} rule"></button>` +
           `<div class="rule-text">If <b>${esc(r.match)}</b> uses more than <b>${metricText(r)}</b> for <b>${r.duration}s</b>, ` +
@@ -432,95 +456,34 @@ function renderRules() {
       }).join("")
     : `<div class="hint-line">No rules yet. Add one above.</div>`;
   $("rules-log").innerHTML = rules.log.length
-    ? rules.log.map((l) => `<div class="log-row"><time>${l.time}</time><span>${esc(l.text)}</span></div>`).join("")
+    ? rules.log.map((l) => `<div class="log-row"><time>${new Date(l.time).toLocaleTimeString()}</time><span>${esc(l.text)}</span></div>`).join("")
     : `<div class="hint-line">Nothing has triggered yet.</div>`;
 }
 
 $("r-add").addEventListener("click", async () => {
   const match = $("r-match").value.trim();
   const threshold = +$("r-threshold").value;
-  const duration = +$("r-duration").value;
+  const duration = Math.round(+$("r-duration").value);
   const metric = $("r-metric").value, action = $("r-action").value;
   if (!match) { toast("Enter part of a process name", true); $("r-match").focus(); return; }
   if (!(threshold > 0) || !(duration > 0)) { toast("Threshold and duration must be positive", true); return; }
   if (action === "kill" && !(await confirmBox("Add an auto-end rule?",
       `Any process whose name contains "${match}" will be ended automatically, without asking, when the rule triggers. Unsaved work in it will be lost.`, "Add rule"))) return;
-  rules.list.push({ id: Date.now().toString(36), match, metric, threshold, duration, action, enabled: true });
-  saveRules();
-  renderRules();
+  await saveRules([...rules.list, { id: Date.now().toString(36), match, metric, threshold, duration, action, enabled: true }]);
   $("r-match").value = "";
   toast("Rule added");
 });
 
 $("rules-list").addEventListener("click", (e) => {
   const t = e.target.closest("[data-toggle]"), d = e.target.closest("[data-del]");
-  if (t) { const r = rules.list.find((x) => x.id === t.dataset.toggle); r.enabled = !r.enabled; }
-  else if (d) rules.list = rules.list.filter((x) => x.id !== d.dataset.del);
-  else return;
-  saveRules();
+  if (t) saveRules(rules.list.map((x) => (x.id === t.dataset.toggle ? { ...x, enabled: !x.enabled } : x)));
+  else if (d) saveRules(rules.list.filter((x) => x.id !== d.dataset.del));
+});
+$("r-clear-log").addEventListener("click", async () => {
+  await invoke("clear_rule_log").catch((e) => toast(e, true));
+  rules.log = [];
   renderRules();
 });
-$("r-clear-log").addEventListener("click", () => { rules.log = []; renderRules(); });
-
-function logRule(text) {
-  rules.log.unshift({ time: new Date().toLocaleTimeString(), text });
-  rules.log.length = Math.min(rules.log.length, 100);
-}
-
-// Called every tick with fresh data.
-function evaluateRules(procs) {
-  const now = Date.now();
-  const seen = new Set();
-  for (const r of rules.list) {
-    if (!r.enabled) continue;
-    const needle = r.match.toLowerCase();
-    const hits = [];
-    for (const p of procs) {
-      if (!p.name.toLowerCase().includes(needle)) continue;
-      const key = `${r.id}:${p.pid}`;
-      const value = r.metric === "cpu" ? p.cpu : p.mem / (1024 * 1024);
-      if (value <= r.threshold) continue;
-      seen.add(key);
-      if (!rules.since.has(key)) rules.since.set(key, now);
-      if (now - rules.since.get(key) < r.duration * 1000) continue;
-      if (now - (rules.fired.get(key) || 0) < COOLDOWN_MS) continue;
-      rules.fired.set(key, now);
-      rules.fired.set(r.id, now);
-      hits.push({ p, value });
-    }
-    if (hits.length) fireRule(r, hits);
-  }
-  for (const k of rules.since.keys()) if (!seen.has(k)) rules.since.delete(k);
-}
-
-// Acts on every matching process, but sends one notification per rule per tick.
-async function fireRule(r, hits) {
-  const fmt = (v) => (r.metric === "cpu" ? `${v.toFixed(0)}% CPU` : `${v.toFixed(0)} MB`);
-  const names = [...new Set(hits.map((h) => h.p.name))].join(", ");
-  const peak = fmt(Math.max(...hits.map((h) => h.value)));
-  const count = hits.length > 1 ? `${hits.length} processes` : `PID ${hits[0].p.pid}`;
-  let done = 0;
-  for (const { p, value } of hits) {
-    const what = `${p.name} (${p.pid}) at ${fmt(value)} for ${r.duration}s+`;
-    try {
-      if (r.action === "kill") await invoke("kill", { pids: [p.pid], tree: false });
-      else if (r.action === "lower") await invoke("set_priority", { pid: p.pid, level: "below" });
-      logRule(`${{ kill: "Ended", lower: "Lowered priority of", notify: "Alert:" }[r.action]} ${what}`);
-      done++;
-    } catch (e) {
-      logRule(`Rule failed on ${p.name} (${p.pid}): ${e}`);
-    }
-  }
-  const title = {
-    kill: `Overseer ended ${names}`,
-    lower: `Overseer lowered priority of ${names}`,
-    notify: `${names} is over ${metricText(r)}`,
-  }[r.action];
-  if (done) {
-    invoke("notify", { title, body: `${count}, peak ${peak}, for ${r.duration}s or more.` }).catch((e) => logRule(`Notification failed: ${e}`));
-  }
-  if (state.tab === "rules") renderRules();
-}
 
 // ---------- events ----------
 $("tabs").addEventListener("click", (e) => { const t = e.target.closest("[data-tab]"); if (t) setTab(t.dataset.tab); });
@@ -617,13 +580,19 @@ async function tick(force = false) {
   if (ticking || (state.paused && !force)) return;
   ticking = true;
   try {
-    state.snap = await invoke("snapshot");
-    evaluateRules(state.snap.procs);
-    renderMetrics(state.snap);
+    const s = await invoke("snapshot");
+    if (!s) return; // sampler hasn't produced its first sample yet
+    for (const p of s.procs) p.net = p.netRx + p.netTx;
+    state.snap = s;
+    renderMetrics(s);
+    renderBandwidthStatus(s.bandwidth);
     if (state.tab === "procs") {
       renderTable();
       renderPanel();
       if (++tickCount % 3 === 0) refreshConns();
+    } else if (state.tab === "rules") {
+      await loadRules();
+      renderRules();
     }
   } catch (e) {
     toast(e, true);
@@ -640,11 +609,22 @@ async function tick(force = false) {
     const b = $("admin");
     b.textContent = info.admin ? "● Admin" : "● Limited, click to elevate";
     b.className = "badge " + (info.admin ? "admin" : "limited");
+    $("s-hotkey").textContent = `${info.hotkey} shows/hides Overseer`;
   } catch (e) { toast(e, true); }
-  saveRules();
+  await migrateLegacyRules();
+  await loadRules();
   await tick(true);
   setInterval(tick, 1000);
 })();
+
+function renderBandwidthStatus(on) {
+  const el = $("s-bw");
+  el.textContent = on ? "Per-process bandwidth: on" : "Per-process bandwidth: needs admin";
+  el.className = on ? "" : "off";
+  el.title = on ? "" : "Click to restart as administrator";
+  $("th-net").title = on ? "Network bandwidth (download + upload)" : "Restart as admin to see per-process bandwidth";
+}
+$("s-bw").addEventListener("click", () => { if (!state.snap?.bandwidth) $("admin").click(); });
 
 // ---------- mock backend for previewing the UI in a normal browser ----------
 function mockInvoke(cmd, args) {
@@ -668,15 +648,19 @@ function mockInvoke(cmd, args) {
   })());
   m.t++;
   const wave = (k) => Math.max(0, Math.sin(m.t / 6 + k) * 0.5 + Math.random() * 0.8);
-  if (cmd === "system_info") return Promise.resolve({ host: "PREVIEW-PC", os: "Windows 11 (mock data)", cpuBrand: "Mock CPU 16-core", cores: 16, admin: false });
+  if (cmd === "system_info") return Promise.resolve({ host: "PREVIEW-PC", os: "Windows 11 (mock data)", cpuBrand: "Mock CPU 16-core", cores: 16, admin: false, hotkey: "Ctrl+Alt+O" });
+  if (cmd === "get_rules") return Promise.resolve({ rules: m.rules ?? [], log: [{ time: Date.now(), text: "Alert: chrome.exe (1234) at 62% CPU for 10s+ (mock)" }], lastFired: {} });
+  if (cmd === "set_rules") { m.rules = args.rules; return Promise.resolve(); }
+  if (cmd === "clear_rule_log") return Promise.resolve();
   if (cmd === "snapshot") {
-    const procs = m.procs.map((p, i) => ({ pid: p.pid, parent: p.parent, name: p.name, conns: p.conns, listening: p.listening, cpu: p.base * wave(i), mem: p.memBase * (0.9 + Math.random() * 0.2), diskRead: Math.random() > 0.85 ? Math.random() * 3e6 : 0, diskWrite: Math.random() > 0.9 ? Math.random() * 1e6 : 0 }));
+    const procs = m.procs.map((p, i) => ({ pid: p.pid, parent: p.parent, name: p.name, conns: p.conns, listening: p.listening,
+      netRx: p.conns ? Math.random() * p.conns * 4e4 : 0, netTx: p.conns ? Math.random() * p.conns * 6e3 : 0, cpu: p.base * wave(i), mem: p.memBase * (0.9 + Math.random() * 0.2), diskRead: Math.random() > 0.85 ? Math.random() * 3e6 : 0, diskWrite: Math.random() > 0.9 ? Math.random() * 1e6 : 0 }));
     const cpu = Math.min(100, procs.reduce((a, p) => a + p.cpu, 0));
     return Promise.resolve({
       cpu, cores: Array.from({ length: 16 }, () => Math.min(100, cpu * (0.4 + Math.random() * 1.2))),
       memUsed: procs.reduce((a, p) => a + p.mem, 0) + 4e9, memTotal: 32 * 1024 ** 3, swapUsed: 1.2e9, swapTotal: 8e9,
       netRx: Math.random() * 4e6 * wave(1), netTx: Math.random() * 6e5, diskRead: procs.reduce((a, p) => a + p.diskRead, 0), diskWrite: procs.reduce((a, p) => a + p.diskWrite, 0),
-      uptime: 3600 * 27 + m.t, procs,
+      uptime: 3600 * 27 + m.t, bandwidth: true, procs,
     });
   }
   if (cmd === "details") {
@@ -684,7 +668,7 @@ function mockInvoke(cmd, args) {
     return Promise.resolve({ pid: p.pid, name: p.name, exe: `C:\\Program Files\\${p.name.replace(".exe", "")}\\${p.name}`, cmd: `"${p.name}" --type=renderer`, cwd: "C:\\Users\\you", parent: par?.pid ?? null, parentName: par?.name, status: "Run", startTime: Date.now() / 1000 - 5000, runTime: 5000, virt: 2.1e9, priority: "normal" });
   }
   if (cmd === "kill") return Promise.resolve(args.pids.length);
-  if (cmd === "set_priority" || cmd === "set_startup" || cmd === "notify") return Promise.resolve();
+  if (cmd === "set_priority" || cmd === "set_startup") return Promise.resolve();
   if (cmd === "connections") {
     const n = m.procs.find((x) => x.pid === args.pid)?.conns || 0;
     return Promise.resolve([

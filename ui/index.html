@@ -72,7 +72,8 @@
             <th data-sort="mem" class="num">Memory</th>
             <th data-sort="diskRead" class="num">Disk read</th>
             <th data-sort="diskWrite" class="num">Disk write</th>
-            <th data-sort="conns" class="num narrow" title="Established TCP connections">Net</th>
+            <th data-sort="net" class="num" id="th-net" title="Network bandwidth (download + upload)">Network</th>
+            <th data-sort="conns" class="num narrow" title="Established TCP connections">Conns</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -91,6 +92,7 @@
         <div><span>CPU</span><b id="d-cpu">–</b></div>
         <div><span>Memory</span><b id="d-mem">–</b></div>
         <div><span>Disk</span><b id="d-disk">–</b></div>
+        <div><span>Network</span><b id="d-net">–</b></div>
       </div>
       <dl id="d-props"></dl>
       <label class="field" id="d-prio-wrap">
@@ -156,7 +158,7 @@
           </select>
           <button class="btn primary" id="r-add">Add rule</button>
         </div>
-        <div class="hint-line">Matches anywhere in the process name, case-insensitive. Each process triggers a rule at most once per minute. Rules run while Overseer is open.</div>
+        <div class="hint-line">Matches anywhere in the process name, case-insensitive. Each process triggers a rule at most once per minute. Rules keep running when you close the window. Overseer stays in the tray until you quit it from there.</div>
       </section>
 
       <section>
@@ -174,6 +176,8 @@
   <footer class="status" id="status">
     <span id="s-count">–</span>
     <span id="s-uptime">–</span>
+    <span id="s-bw">–</span>
+    <span id="s-hotkey"></span>
     <span class="hint">/ search · 1 2 3 views · Space pause · Del end task · Esc clear</span>
   </footer>
 
