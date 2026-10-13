@@ -17,6 +17,9 @@ const state = {
   paused: false,
   collapsed: new Set(),
   info: null,
+  tab: "procs",
+  conns: null,
+  startup: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -139,8 +142,9 @@ function buildRows(procs) {
     for (const p of procs) {
       if (!matches(p, f)) continue;
       let g = groups.get(p.name);
-      if (!g) groups.set(p.name, (g = { name: p.name, pid: p.pid, pids: [], cpu: 0, mem: 0, diskRead: 0, diskWrite: 0 }));
+      if (!g) groups.set(p.name, (g = { name: p.name, pid: p.pid, pids: [], cpu: 0, mem: 0, diskRead: 0, diskWrite: 0, conns: 0, listening: 0 }));
       g.pids.push(p.pid); g.cpu += p.cpu; g.mem += p.mem; g.diskRead += p.diskRead; g.diskWrite += p.diskWrite;
+      g.conns += p.conns; g.listening += p.listening;
       g.pid = Math.min(g.pid, p.pid);
     }
     return [...groups.values()].sort(sorter).map((g) => ({ p: g, depth: 0, group: true }));
@@ -199,6 +203,7 @@ function renderTable() {
         `<td class="num${p.mem > 2e8 ? " hot" : ""}" style="${heat(p.mem, memMax, "167,139,250")}">${fmtBytes(p.mem)}</td>` +
         `<td class="num" style="${heat(p.diskRead, 2e7, "246,173,85")}">${fmtRate(p.diskRead)}</td>` +
         `<td class="num" style="${heat(p.diskWrite, 2e7, "246,173,85")}">${fmtRate(p.diskWrite)}</td>` +
+        `<td class="num narrow${p.conns ? " hot" : ""}" style="${heat(p.conns, 40, "99,179,237")}" title="${p.conns} established · ${p.listening} listening">${p.conns || (p.listening ? "·" : "–")}</td>` +
       `</tr>`
     );
   }
@@ -220,14 +225,42 @@ function selectedPids() {
 async function select(sel) {
   state.sel = sel;
   state.details = null;
+  state.conns = null;
   renderTable();
   if (!sel) { $("panel").hidden = true; return; }
   $("panel").hidden = false;
+  renderConns();
   if (sel.pid != null) {
     try { state.details = await invoke("details", { pid: sel.pid }); }
     catch (e) { toast(e, true); }
+    refreshConns();
   }
   renderPanel();
+}
+
+async function refreshConns() {
+  const pid = state.sel?.pid;
+  if (pid == null) return;
+  try {
+    const conns = await invoke("connections", { pid });
+    if (state.sel?.pid === pid) { state.conns = conns; renderConns(); }
+  } catch (e) { /* process may have exited */ }
+}
+
+function renderConns() {
+  const wrap = $("d-conns-wrap");
+  wrap.hidden = state.sel?.pid == null;
+  if (wrap.hidden) return;
+  const list = state.conns;
+  if (!list) { $("d-conns").innerHTML = `<div class="hint-line">Loading…</div>`; $("d-conns-count").textContent = ""; return; }
+  $("d-conns-count").textContent = list.length ? `(${list.length})` : "";
+  if (!list.length) { $("d-conns").innerHTML = `<div class="hint-line">No network connections.</div>`; return; }
+  const cls = (s) => (s === "Established" ? "est" : s === "Listen" ? "listen" : "");
+  $("d-conns").innerHTML = list.slice(0, 80).map((c) =>
+    `<div class="conn"><span class="proto">${c.proto}</span>` +
+    `<span class="addr">${c.remote && !/^0\.0\.0\.0:0$|^\[::\]:0$/.test(c.remote) ? esc(c.remote) : esc(c.local)}</span>` +
+    `<span class="state ${cls(c.state)}">${c.state ? esc(c.state) : "bound"}${c.remote && !/:0$/.test(c.remote) ? ` · local ${esc(c.local)}` : ""}</span></div>`
+  ).join("") + (list.length > 80 ? `<div class="hint-line">+${list.length - 80} more</div>` : "");
 }
 
 function renderPanel() {
@@ -320,7 +353,177 @@ function setMode(m) {
   renderTable();
 }
 
+// ---------- tabs ----------
+function setTab(tab) {
+  state.tab = tab;
+  document.querySelectorAll("#tabs button").forEach((b) => b.classList.toggle("on", b.dataset.tab === tab));
+  $("view-procs").hidden = tab !== "procs";
+  $("view-startup").hidden = tab !== "startup";
+  $("view-rules").hidden = tab !== "rules";
+  $("modes").style.visibility = tab === "procs" ? "" : "hidden";
+  $("search").parentElement.style.visibility = tab === "rules" ? "hidden" : "";
+  $("search").placeholder = tab === "startup" ? "Filter startup apps" : "Filter by name or PID";
+  if (tab === "procs") renderTable();
+  if (tab === "startup") loadStartup();
+  if (tab === "rules") renderRules();
+}
+
+// ---------- startup apps ----------
+async function loadStartup() {
+  try { state.startup = await invoke("startup_items"); }
+  catch (e) { toast(e, true); state.startup = []; }
+  renderStartup();
+}
+
+function renderStartup() {
+  const items = (state.startup || []).filter((i) =>
+    !state.filter || i.name.toLowerCase().includes(state.filter) || i.command.toLowerCase().includes(state.filter));
+  $("startup-empty").hidden = items.length > 0 || state.startup == null;
+  document.querySelector("#startup tbody").innerHTML = items.map((i) =>
+    `<tr class="${i.enabled ? "" : "off"}">` +
+      `<td class="col-toggle"><button class="switch${i.enabled ? " on" : ""}" data-idx="${state.startup.indexOf(i)}" title="${i.enabled ? "Disable" : "Enable"}"></button></td>` +
+      `<td title="${esc(i.name)}">${esc(i.name)}</td>` +
+      `<td class="cmd" title="${esc(i.command)}">${esc(i.command)}</td>` +
+      `<td class="loc col-loc">${esc(i.location)}</td>` +
+    `</tr>`).join("");
+}
+
+document.querySelector("#startup tbody").addEventListener("click", async (e) => {
+  const sw = e.target.closest(".switch");
+  if (!sw) return;
+  const item = state.startup[+sw.dataset.idx];
+  const enabled = !item.enabled;
+  try {
+    await invoke("set_startup", { scope: item.scope, approved: item.approved, name: item.name, enabled });
+    item.enabled = enabled;
+    toast(`${item.name} ${enabled ? "enabled" : "disabled"} at startup`);
+    renderStartup();
+  } catch (err) { toast(err, true); }
+});
+
+// ---------- rules ----------
+const RULES_KEY = "overseer.rules.v1";
+const COOLDOWN_MS = 60_000;
+const rules = { list: loadRules(), since: new Map(), fired: new Map(), log: [] };
+
+function loadRules() {
+  try { return JSON.parse(localStorage.getItem(RULES_KEY)) || []; } catch { return []; }
+}
+function saveRules() {
+  try { localStorage.setItem(RULES_KEY, JSON.stringify(rules.list)); } catch {}
+  const n = rules.list.filter((r) => r.enabled).length;
+  $("rules-count").hidden = !n;
+  $("rules-count").textContent = n;
+}
+
+const ACTION_TEXT = { notify: "notify me", lower: "lower its priority", kill: "end it" };
+const metricText = (r) => (r.metric === "cpu" ? `${r.threshold}% CPU` : `${r.threshold} MB memory`);
+
+function renderRules() {
+  $("rules-list").innerHTML = rules.list.length
+    ? rules.list.map((r) => {
+        const last = rules.fired.get(r.id);
+        return `<div class="rule${r.enabled ? "" : " off"}">` +
+          `<button class="switch${r.enabled ? " on" : ""}" data-toggle="${r.id}" title="${r.enabled ? "Pause" : "Resume"} rule"></button>` +
+          `<div class="rule-text">If <b>${esc(r.match)}</b> uses more than <b>${metricText(r)}</b> for <b>${r.duration}s</b>, ` +
+          `<span class="act-${r.action}">${ACTION_TEXT[r.action]}</span></div>` +
+          (last ? `<span class="rule-fired">last fired ${new Date(last).toLocaleTimeString()}</span>` : "") +
+          `<button class="icon-btn" data-del="${r.id}" title="Delete rule">✕</button></div>`;
+      }).join("")
+    : `<div class="hint-line">No rules yet. Add one above.</div>`;
+  $("rules-log").innerHTML = rules.log.length
+    ? rules.log.map((l) => `<div class="log-row"><time>${l.time}</time><span>${esc(l.text)}</span></div>`).join("")
+    : `<div class="hint-line">Nothing has triggered yet.</div>`;
+}
+
+$("r-add").addEventListener("click", async () => {
+  const match = $("r-match").value.trim();
+  const threshold = +$("r-threshold").value;
+  const duration = +$("r-duration").value;
+  const metric = $("r-metric").value, action = $("r-action").value;
+  if (!match) { toast("Enter part of a process name", true); $("r-match").focus(); return; }
+  if (!(threshold > 0) || !(duration > 0)) { toast("Threshold and duration must be positive", true); return; }
+  if (action === "kill" && !(await confirmBox("Add an auto-end rule?",
+      `Any process whose name contains "${match}" will be ended automatically, without asking, when the rule triggers. Unsaved work in it will be lost.`, "Add rule"))) return;
+  rules.list.push({ id: Date.now().toString(36), match, metric, threshold, duration, action, enabled: true });
+  saveRules();
+  renderRules();
+  $("r-match").value = "";
+  toast("Rule added");
+});
+
+$("rules-list").addEventListener("click", (e) => {
+  const t = e.target.closest("[data-toggle]"), d = e.target.closest("[data-del]");
+  if (t) { const r = rules.list.find((x) => x.id === t.dataset.toggle); r.enabled = !r.enabled; }
+  else if (d) rules.list = rules.list.filter((x) => x.id !== d.dataset.del);
+  else return;
+  saveRules();
+  renderRules();
+});
+$("r-clear-log").addEventListener("click", () => { rules.log = []; renderRules(); });
+
+function logRule(text) {
+  rules.log.unshift({ time: new Date().toLocaleTimeString(), text });
+  rules.log.length = Math.min(rules.log.length, 100);
+}
+
+// Called every tick with fresh data.
+function evaluateRules(procs) {
+  const now = Date.now();
+  const seen = new Set();
+  for (const r of rules.list) {
+    if (!r.enabled) continue;
+    const needle = r.match.toLowerCase();
+    const hits = [];
+    for (const p of procs) {
+      if (!p.name.toLowerCase().includes(needle)) continue;
+      const key = `${r.id}:${p.pid}`;
+      const value = r.metric === "cpu" ? p.cpu : p.mem / (1024 * 1024);
+      if (value <= r.threshold) continue;
+      seen.add(key);
+      if (!rules.since.has(key)) rules.since.set(key, now);
+      if (now - rules.since.get(key) < r.duration * 1000) continue;
+      if (now - (rules.fired.get(key) || 0) < COOLDOWN_MS) continue;
+      rules.fired.set(key, now);
+      rules.fired.set(r.id, now);
+      hits.push({ p, value });
+    }
+    if (hits.length) fireRule(r, hits);
+  }
+  for (const k of rules.since.keys()) if (!seen.has(k)) rules.since.delete(k);
+}
+
+// Acts on every matching process, but sends one notification per rule per tick.
+async function fireRule(r, hits) {
+  const fmt = (v) => (r.metric === "cpu" ? `${v.toFixed(0)}% CPU` : `${v.toFixed(0)} MB`);
+  const names = [...new Set(hits.map((h) => h.p.name))].join(", ");
+  const peak = fmt(Math.max(...hits.map((h) => h.value)));
+  const count = hits.length > 1 ? `${hits.length} processes` : `PID ${hits[0].p.pid}`;
+  let done = 0;
+  for (const { p, value } of hits) {
+    const what = `${p.name} (${p.pid}) at ${fmt(value)} for ${r.duration}s+`;
+    try {
+      if (r.action === "kill") await invoke("kill", { pids: [p.pid], tree: false });
+      else if (r.action === "lower") await invoke("set_priority", { pid: p.pid, level: "below" });
+      logRule(`${{ kill: "Ended", lower: "Lowered priority of", notify: "Alert:" }[r.action]} ${what}`);
+      done++;
+    } catch (e) {
+      logRule(`Rule failed on ${p.name} (${p.pid}): ${e}`);
+    }
+  }
+  const title = {
+    kill: `Overseer ended ${names}`,
+    lower: `Overseer lowered priority of ${names}`,
+    notify: `${names} is over ${metricText(r)}`,
+  }[r.action];
+  if (done) {
+    invoke("notify", { title, body: `${count}, peak ${peak}, for ${r.duration}s or more.` }).catch((e) => logRule(`Notification failed: ${e}`));
+  }
+  if (state.tab === "rules") renderRules();
+}
+
 // ---------- events ----------
+$("tabs").addEventListener("click", (e) => { const t = e.target.closest("[data-tab]"); if (t) setTab(t.dataset.tab); });
 document.querySelector("thead").addEventListener("click", (e) => {
   const k = e.target.closest("th")?.dataset.sort;
   if (!k) return;
@@ -347,7 +550,10 @@ $("d-props").addEventListener("click", (e) => {
   if (a) select({ pid: +a.dataset.goto });
 });
 
-$("search").addEventListener("input", (e) => { state.filter = e.target.value.trim().toLowerCase(); renderTable(); });
+$("search").addEventListener("input", (e) => {
+  state.filter = e.target.value.trim().toLowerCase();
+  state.tab === "startup" ? renderStartup() : renderTable();
+});
 $("modes").addEventListener("click", (e) => { const m = e.target.dataset.mode; if (m) setMode(m); });
 $("pause").addEventListener("click", togglePause);
 $("d-close").addEventListener("click", () => select(null));
@@ -378,16 +584,19 @@ function togglePause() {
 
 document.addEventListener("keydown", (e) => {
   if (!$("modal").hidden) return;
+  if (e.ctrlKey && ["1", "2", "3"].includes(e.key)) { e.preventDefault(); setTab(["procs", "startup", "rules"][+e.key - 1]); return; }
+  if (e.target.matches("input:not(#search), select")) return; // typing in the rules form
   const typing = e.target === $("search");
   if ((e.key === "/" && !typing) || (e.key === "f" && e.ctrlKey)) { e.preventDefault(); $("search").focus(); $("search").select(); return; }
   if (e.key === "Escape") {
-    if (typing && state.filter) { $("search").value = ""; state.filter = ""; renderTable(); }
+    if (typing && state.filter) { $("search").value = ""; state.filter = ""; state.tab === "startup" ? renderStartup() : renderTable(); }
     else if (typing) $("search").blur();
     else select(null);
     return;
   }
   if (typing) return;
   if (e.key === " ") { e.preventDefault(); togglePause(); }
+  else if (state.tab !== "procs") return;
   else if (e.key === "Delete") endSelected(e.shiftKey);
   else if (e.key === "1") setMode("list");
   else if (e.key === "2") setMode("tree");
@@ -403,14 +612,19 @@ document.addEventListener("keydown", (e) => {
 
 // ---------- loop ----------
 let ticking = false;
+let tickCount = 0;
 async function tick(force = false) {
   if (ticking || (state.paused && !force)) return;
   ticking = true;
   try {
     state.snap = await invoke("snapshot");
+    evaluateRules(state.snap.procs);
     renderMetrics(state.snap);
-    renderTable();
-    renderPanel();
+    if (state.tab === "procs") {
+      renderTable();
+      renderPanel();
+      if (++tickCount % 3 === 0) refreshConns();
+    }
   } catch (e) {
     toast(e, true);
   } finally {
@@ -427,6 +641,7 @@ async function tick(force = false) {
     b.textContent = info.admin ? "● Admin" : "● Limited, click to elevate";
     b.className = "badge " + (info.admin ? "admin" : "limited");
   } catch (e) { toast(e, true); }
+  saveRules();
   await tick(true);
   setInterval(tick, 1000);
 })();
@@ -444,14 +659,18 @@ function mockInvoke(cmd, args) {
     const [chrome] = add("chrome.exe", explorer); add("chrome.exe", chrome, 18);
     const [code] = add("Code.exe", explorer); add("Code.exe", code, 7); const [node] = add("node.exe", code); add("cargo.exe", node);
     for (const n of names.slice(10)) if (!procs.some((p) => p.name === n)) add(n, Math.random() > 0.5 ? explorer : null);
-    procs.forEach((p) => { p.base = Math.random() ** 3 * 8; p.memBase = Math.random() ** 2 * 6e8 + 4e6; });
+    procs.forEach((p) => {
+      p.base = Math.random() ** 3 * 8; p.memBase = Math.random() ** 2 * 6e8 + 4e6;
+      p.conns = /chrome|Discord|Spotify|Teams|steam/.test(p.name) ? Math.floor(Math.random() * 30) : 0;
+      p.listening = p.name === "svchost.exe" && Math.random() > 0.7 ? 1 : 0;
+    });
     return { procs, t: 0 };
   })());
   m.t++;
   const wave = (k) => Math.max(0, Math.sin(m.t / 6 + k) * 0.5 + Math.random() * 0.8);
   if (cmd === "system_info") return Promise.resolve({ host: "PREVIEW-PC", os: "Windows 11 (mock data)", cpuBrand: "Mock CPU 16-core", cores: 16, admin: false });
   if (cmd === "snapshot") {
-    const procs = m.procs.map((p, i) => ({ pid: p.pid, parent: p.parent, name: p.name, cpu: p.base * wave(i), mem: p.memBase * (0.9 + Math.random() * 0.2), diskRead: Math.random() > 0.85 ? Math.random() * 3e6 : 0, diskWrite: Math.random() > 0.9 ? Math.random() * 1e6 : 0 }));
+    const procs = m.procs.map((p, i) => ({ pid: p.pid, parent: p.parent, name: p.name, conns: p.conns, listening: p.listening, cpu: p.base * wave(i), mem: p.memBase * (0.9 + Math.random() * 0.2), diskRead: Math.random() > 0.85 ? Math.random() * 3e6 : 0, diskWrite: Math.random() > 0.9 ? Math.random() * 1e6 : 0 }));
     const cpu = Math.min(100, procs.reduce((a, p) => a + p.cpu, 0));
     return Promise.resolve({
       cpu, cores: Array.from({ length: 16 }, () => Math.min(100, cpu * (0.4 + Math.random() * 1.2))),
@@ -465,6 +684,23 @@ function mockInvoke(cmd, args) {
     return Promise.resolve({ pid: p.pid, name: p.name, exe: `C:\\Program Files\\${p.name.replace(".exe", "")}\\${p.name}`, cmd: `"${p.name}" --type=renderer`, cwd: "C:\\Users\\you", parent: par?.pid ?? null, parentName: par?.name, status: "Run", startTime: Date.now() / 1000 - 5000, runTime: 5000, virt: 2.1e9, priority: "normal" });
   }
   if (cmd === "kill") return Promise.resolve(args.pids.length);
-  if (cmd === "set_priority") return Promise.resolve();
+  if (cmd === "set_priority" || cmd === "set_startup" || cmd === "notify") return Promise.resolve();
+  if (cmd === "connections") {
+    const n = m.procs.find((x) => x.pid === args.pid)?.conns || 0;
+    return Promise.resolve([
+      ...Array.from({ length: n }, (_, i) => ({ pid: args.pid, proto: "TCP", local: `192.168.1.20:${50000 + i}`, remote: `142.250.${i}.14:443`, state: "Established" })),
+      { pid: args.pid, proto: "UDP", local: "0.0.0.0:5353", remote: "", state: "" },
+    ]);
+  }
+  if (cmd === "startup_items") {
+    const mk = (name, command, location, scope, approved, enabled = true) => ({ name, command, location, scope, approved, enabled });
+    return Promise.resolve([
+      mk("Discord", "C:\\Users\\you\\AppData\\Local\\Discord\\Update.exe --processStart Discord.exe", "Registry · current user", "user", "Run"),
+      mk("Spotify", "C:\\Users\\you\\AppData\\Roaming\\Spotify\\Spotify.exe /minimized", "Registry · current user", "user", "Run", false),
+      mk("SecurityHealth", "%windir%\\system32\\SecurityHealthSystray.exe", "Registry · all users", "machine", "Run"),
+      mk("Steam", "\"C:\\Program Files (x86)\\Steam\\steam.exe\" -silent", "Registry · all users (32-bit)", "machine", "Run32"),
+      mk("OneNote.lnk", "C:\\Users\\you\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\OneNote.lnk", "Startup folder · current user", "user", "StartupFolder"),
+    ]);
+  }
   return Promise.reject(`"${cmd}" isn't available in preview mode`);
 }

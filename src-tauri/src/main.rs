@@ -1,6 +1,8 @@
 // Hide the console window in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod net;
+mod startup;
 mod win;
 
 use std::collections::HashMap;
@@ -35,6 +37,8 @@ struct Proc {
     mem: u64,
     disk_read: f64,
     disk_write: f64,
+    conns: u32,
+    listening: u32,
 }
 
 #[derive(Serialize)]
@@ -109,13 +113,17 @@ async fn snapshot(state: State<'_, AppState>) -> Result<Snapshot, String> {
         tx += d.transmitted();
     }
 
+    let conns = net::counts();
     let procs: Vec<Proc> = sys
         .processes()
         .values()
         .filter(|p| p.pid().as_u32() != 0) // "System Idle Process"
         .map(|p| {
             let d = p.disk_usage();
+            let c = conns.get(&p.pid().as_u32()).copied().unwrap_or_default();
             Proc {
+                conns: c.established,
+                listening: c.listening,
                 pid: p.pid().as_u32(),
                 parent: real_parent(sys, p).map(|x| x.as_u32()),
                 name: lossy(p.name()),
@@ -239,6 +247,27 @@ async fn open_location(state: State<'_, AppState>, pid: u32) -> Result<(), Strin
 }
 
 #[tauri::command]
+async fn connections(pid: u32) -> Vec<net::Conn> {
+    net::for_pid(pid)
+}
+
+#[tauri::command]
+async fn startup_items() -> Vec<startup::StartupItem> {
+    startup::list()
+}
+
+#[tauri::command]
+fn set_startup(scope: String, approved: String, name: String, enabled: bool) -> Result<(), String> {
+    startup::set_enabled(&scope, &approved, &name, enabled)
+}
+
+#[tauri::command]
+fn notify(app: tauri::AppHandle, title: String, body: String) -> Result<(), String> {
+    use tauri_plugin_notification::NotificationExt;
+    app.notification().builder().title(title).body(body).show().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn restart_as_admin(app: tauri::AppHandle) -> Result<(), String> {
     win::relaunch_as_admin()?;
     app.exit(0);
@@ -250,6 +279,7 @@ fn main() {
     sys.refresh_all();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .manage(AppState(Mutex::new(Monitor {
             sys,
             nets: Networks::new_with_refreshed_list(),
@@ -262,6 +292,10 @@ fn main() {
             kill,
             set_priority,
             open_location,
+            connections,
+            startup_items,
+            set_startup,
+            notify,
             restart_as_admin
         ])
         .run(tauri::generate_context!())

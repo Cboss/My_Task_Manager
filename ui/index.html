@@ -16,6 +16,12 @@
       </div>
     </div>
 
+    <nav class="tabs" id="tabs">
+      <button data-tab="procs" class="on" title="Ctrl+1">Processes</button>
+      <button data-tab="startup" title="Ctrl+2">Startup</button>
+      <button data-tab="rules" title="Ctrl+3">Rules <span class="pill" id="rules-count" hidden></span></button>
+    </nav>
+
     <div class="search">
       <svg viewBox="0 0 24 24" width="16" height="16"><path d="M10 4a6 6 0 1 0 3.9 10.6l4.7 4.7 1.4-1.4-4.7-4.7A6 6 0 0 0 10 4zm0 2a4 4 0 1 1 0 8 4 4 0 0 1 0-8z" fill="currentColor"/></svg>
       <input id="search" placeholder="Filter by name or PID" autocomplete="off" spellcheck="false" />
@@ -55,7 +61,7 @@
     </div>
   </section>
 
-  <main class="body">
+  <main class="body" id="view-procs">
     <div class="table-wrap">
       <table id="procs">
         <thead>
@@ -66,6 +72,7 @@
             <th data-sort="mem" class="num">Memory</th>
             <th data-sort="diskRead" class="num">Disk read</th>
             <th data-sort="diskWrite" class="num">Disk write</th>
+            <th data-sort="conns" class="num narrow" title="Established TCP connections">Net</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -102,7 +109,66 @@
         <button class="btn danger ghost" id="d-killtree">End tree <kbd>⇧Del</kbd></button>
         <button class="btn" id="d-open">Open file location</button>
       </div>
+      <div class="conns" id="d-conns-wrap">
+        <div class="section-title">Connections <span id="d-conns-count"></span></div>
+        <div id="d-conns"></div>
+      </div>
     </aside>
+  </main>
+
+  <main class="body single" id="view-startup" hidden>
+    <div class="table-wrap">
+      <table id="startup">
+        <thead>
+          <tr>
+            <th class="col-toggle"></th>
+            <th>Name</th>
+            <th>Command</th>
+            <th class="col-loc">Location</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div class="empty" id="startup-empty" hidden>No startup items found.</div>
+    </div>
+  </main>
+
+  <main class="body single" id="view-rules" hidden>
+    <div class="rules-layout">
+      <section class="rule-form">
+        <div class="section-title">New rule</div>
+        <div class="sentence">
+          <span>If a process named</span>
+          <input id="r-match" placeholder="e.g. chrome" spellcheck="false" />
+          <span>uses more than</span>
+          <input id="r-threshold" type="number" min="1" value="50" class="short" />
+          <select id="r-metric">
+            <option value="cpu">% CPU</option>
+            <option value="mem">MB memory</option>
+          </select>
+          <span>for</span>
+          <input id="r-duration" type="number" min="1" value="10" class="short" />
+          <span>seconds, then</span>
+          <select id="r-action">
+            <option value="notify">notify me</option>
+            <option value="lower">lower its priority</option>
+            <option value="kill">end it</option>
+          </select>
+          <button class="btn primary" id="r-add">Add rule</button>
+        </div>
+        <div class="hint-line">Matches anywhere in the process name, case-insensitive. Each process triggers a rule at most once per minute. Rules run while Overseer is open.</div>
+      </section>
+
+      <section>
+        <div class="section-title">Rules</div>
+        <div id="rules-list"></div>
+      </section>
+
+      <section>
+        <div class="section-title">Activity <button class="link" id="r-clear-log">clear</button></div>
+        <div id="rules-log"></div>
+      </section>
+    </div>
   </main>
 
   <footer class="status" id="status">
