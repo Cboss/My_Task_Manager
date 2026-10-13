@@ -8,9 +8,10 @@ use std::process::Command;
 
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::System::Threading::{
-    GetPriorityClass, OpenProcess, SetPriorityClass, ABOVE_NORMAL_PRIORITY_CLASS,
+    GetPriorityClass, OpenProcess, SetPriorityClass, WaitForSingleObject, ABOVE_NORMAL_PRIORITY_CLASS,
     BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, REALTIME_PRIORITY_CLASS,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_SYNCHRONIZE,
+    REALTIME_PRIORITY_CLASS,
 };
 use windows_sys::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
 
@@ -75,17 +76,41 @@ pub fn reveal_in_explorer(path: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+pub const WAIT_FLAG: &str = "--wait-for";
+
+/// If launched with `--wait-for <pid>`, block (up to 10s) until that process exits.
+pub fn wait_for_previous_instance() {
+    let args: Vec<String> = std::env::args().collect();
+    let Some(pid) = args
+        .iter()
+        .position(|a| a == WAIT_FLAG)
+        .and_then(|i| args.get(i + 1))
+        .and_then(|p| p.parse::<u32>().ok())
+    else {
+        return;
+    };
+    unsafe {
+        let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if !h.is_null() {
+            WaitForSingleObject(h, 10_000);
+            CloseHandle(h);
+        }
+    }
+}
+
 /// Relaunch this exe through the UAC "runas" verb.
 pub fn relaunch_as_admin() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let verb = wide(OsStr::new("runas"));
     let file = wide(exe.as_os_str());
+    // The new copy waits for this one to exit, so the single-instance guard lets it start.
+    let params = wide(OsStr::new(&format!("{WAIT_FLAG} {}", std::process::id())));
     let r = unsafe {
         ShellExecuteW(
             std::ptr::null_mut(),
             verb.as_ptr(),
             file.as_ptr(),
-            std::ptr::null(),
+            params.as_ptr(),
             std::ptr::null(),
             1, // SW_SHOWNORMAL
         )

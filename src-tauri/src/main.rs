@@ -1,6 +1,7 @@
 // Hide the console window in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod autostart;
 mod etw;
 mod net;
 mod rules;
@@ -386,6 +387,17 @@ fn clear_rule_log(state: State<'_, Shared>) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn get_autostart() -> Result<autostart::Status, String> {
+    autostart::status()
+}
+
+#[tauri::command]
+async fn set_autostart(enabled: bool, elevated: bool) -> Result<autostart::Status, String> {
+    autostart::set(enabled, elevated)?;
+    autostart::status()
+}
+
+#[tauri::command]
 fn restart_as_admin(app: AppHandle) -> Result<(), String> {
     win::relaunch_as_admin()?;
     app.exit(0);
@@ -393,6 +405,9 @@ fn restart_as_admin(app: AppHandle) -> Result<(), String> {
 }
 
 fn main() {
+    win::wait_for_previous_instance();
+    let start_hidden = std::env::args().any(|a| a == autostart::MINIMIZED_FLAG);
+
     let mut sys = System::new_all();
     sys.refresh_all();
     let monitor = Arc::new(Mutex::new(Monitor {
@@ -402,6 +417,8 @@ fn main() {
     }));
 
     let app = tauri::Builder::default()
+        // Must be first: a second launch just brings the running copy forward.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
         .plugin(tauri_plugin_notification::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -428,6 +445,11 @@ fn main() {
             build_tray(app)?;
             if let Err(e) = app.global_shortcut().register(hotkey()) {
                 eprintln!("couldn't register {HOTKEY_LABEL}: {e}");
+            }
+
+            // The window starts hidden (see tauri.conf.json); autostart keeps it in the tray.
+            if !start_hidden {
+                show_main(app.handle());
             }
 
             let handle = app.handle().clone();
@@ -464,6 +486,8 @@ fn main() {
             get_rules,
             set_rules,
             clear_rule_log,
+            get_autostart,
+            set_autostart,
             restart_as_admin
         ])
         .build(tauri::generate_context!())

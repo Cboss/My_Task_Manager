@@ -367,7 +367,7 @@ function setTab(tab) {
   $("search").parentElement.style.visibility = tab === "rules" ? "hidden" : "";
   $("search").placeholder = tab === "startup" ? "Filter startup apps" : "Filter by name or PID";
   if (tab === "procs") renderTable();
-  if (tab === "startup") loadStartup();
+  if (tab === "startup") { loadStartup(); loadAutostart(); }
   if (tab === "rules") renderRules();
 }
 
@@ -403,6 +403,43 @@ document.querySelector("#startup tbody").addEventListener("click", async (e) => 
     renderStartup();
   } catch (err) { toast(err, true); }
 });
+
+// ---------- Overseer's own autostart ----------
+let autostart = null;
+
+async function loadAutostart() {
+  try { autostart = await invoke("get_autostart"); } catch (e) { toast(e, true); }
+  renderAutostart();
+}
+
+function renderAutostart() {
+  if (!autostart) return;
+  $("as-switch").classList.toggle("on", autostart.enabled);
+  $("as-elevated").checked = autostart.elevated || (!autostart.enabled && $("as-elevated").checked);
+  const hint = $("as-hint");
+  hint.classList.toggle("warn", autostart.devBuild);
+  hint.textContent = autostart.devBuild
+    ? "This is a development build, so autostart would point at it. Turn this on from the installed Overseer instead."
+    : !autostart.enabled ? "Off. Overseer starts only when you open it."
+    : autostart.elevated ? "On, as administrator: starts quietly in the tray with bandwidth on, no UAC prompt."
+    : "On: starts quietly in the tray. Tick “as administrator” to get per-process bandwidth too.";
+}
+
+async function setAutostart(enabled, elevated) {
+  $("as-switch").disabled = true;
+  try {
+    autostart = await invoke("set_autostart", { enabled, elevated });
+    toast(enabled ? `Overseer will start at sign-in${elevated ? " as administrator" : ""}` : "Overseer won't start at sign-in");
+  } catch (e) {
+    toast(e, true);
+  } finally {
+    $("as-switch").disabled = false;
+    renderAutostart();
+  }
+}
+
+$("as-switch").addEventListener("click", () => setAutostart(!autostart?.enabled, $("as-elevated").checked));
+$("as-elevated").addEventListener("change", (e) => { if (autostart?.enabled) setAutostart(true, e.target.checked); });
 
 // ---------- rules (evaluated by the Rust sampler; this is just the editor) ----------
 const LEGACY_RULES_KEY = "overseer.rules.v1"; // rules lived in localStorage before v0.3
@@ -652,6 +689,8 @@ function mockInvoke(cmd, args) {
   if (cmd === "get_rules") return Promise.resolve({ rules: m.rules ?? [], log: [{ time: Date.now(), text: "Alert: chrome.exe (1234) at 62% CPU for 10s+ (mock)" }], lastFired: {} });
   if (cmd === "set_rules") { m.rules = args.rules; return Promise.resolve(); }
   if (cmd === "clear_rule_log") return Promise.resolve();
+  if (cmd === "get_autostart") return Promise.resolve(m.autostart ??= { enabled: false, elevated: false, exe: "C:\\Program Files\\Overseer\\overseer.exe", devBuild: false });
+  if (cmd === "set_autostart") return Promise.resolve((m.autostart = { ...m.autostart, enabled: args.enabled, elevated: args.enabled && args.elevated }));
   if (cmd === "snapshot") {
     const procs = m.procs.map((p, i) => ({ pid: p.pid, parent: p.parent, name: p.name, conns: p.conns, listening: p.listening,
       netRx: p.conns ? Math.random() * p.conns * 4e4 : 0, netTx: p.conns ? Math.random() * p.conns * 6e3 : 0, cpu: p.base * wave(i), mem: p.memBase * (0.9 + Math.random() * 0.2), diskRead: Math.random() > 0.85 ? Math.random() * 3e6 : 0, diskWrite: Math.random() > 0.9 ? Math.random() * 1e6 : 0 }));

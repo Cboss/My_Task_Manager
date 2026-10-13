@@ -205,6 +205,19 @@ button.link { border: 0; background: none; color: var(--accent); cursor: pointer
 .conn .state.listen { color: var(--net); }
 
 /* ---------- startup ---------- */
+.body.column { flex-direction: column; }
+.self-card {
+  display: flex; align-items: center; gap: 14px; flex-shrink: 0;
+  background: var(--bg-2); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px;
+}
+.logo.small { width: 22px; height: 22px; border-radius: 6px; flex-shrink: 0; }
+.self-text { flex: 1; min-width: 0; }
+.self-title { font-weight: 600; }
+.self-card .hint-line { margin-top: 2px; }
+.self-card .hint-line.warn { color: var(--disk); }
+.check { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); cursor: pointer; white-space: nowrap; }
+.check input { accent-color: var(--accent); }
+.switch:disabled { opacity: .5; cursor: wait; }
 #startup td { white-space: nowrap; }
 #startup td.cmd { font: 11px var(--mono); color: var(--muted); user-select: text; }
 #startup td.loc { color: var(--dim); font-size: 12px; }

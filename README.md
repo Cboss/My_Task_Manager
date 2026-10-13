@@ -17,7 +17,9 @@ cargo run              # dev build (first build takes a few minutes)
 cargo run --release    # optimised build
 ```
 
-To produce an installer: `cargo install tauri-cli --version "^2"` then `cargo tauri build` (from `overseer/src-tauri`).
+To produce an installer: `cargo install tauri-cli --version "^2"` then `cargo tauri build` (from `overseer/src-tauri`). The installer lands in `src-tauri/target/release/bundle/nsis/`.
+
+Start at sign-in: Startup tab → "Start Overseer when I sign in". Tick "as administrator" for per-process bandwidth; that uses a Task Scheduler logon task with highest privileges, so there's no UAC prompt. Overseer starts hidden in the tray (`--minimized`).
 
 To tweak the UI without Rust, open `ui/index.html` through any static server: it falls back to mock data.
 

@@ -118,7 +118,18 @@
     </aside>
   </main>
 
-  <main class="body single" id="view-startup" hidden>
+  <main class="body single column" id="view-startup" hidden>
+    <section class="self-card">
+      <span class="logo small"></span>
+      <div class="self-text">
+        <div class="self-title">Start Overseer when I sign in</div>
+        <div class="hint-line" id="as-hint">…</div>
+      </div>
+      <label class="check" title="Starts with admin rights so per-process bandwidth works, without a UAC prompt at sign-in">
+        <input type="checkbox" id="as-elevated" /> as administrator
+      </label>
+      <button class="switch" id="as-switch" title="Start at sign-in"></button>
+    </section>
     <div class="table-wrap">
       <table id="startup">
         <thead>
