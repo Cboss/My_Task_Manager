@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use sysinfo::{Networks, Pid, System};
+use sysinfo::{Networks, Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, State};
@@ -129,8 +129,16 @@ fn real_parent(sys: &System, p: &sysinfo::Process) -> Option<Pid> {
     (parent.start_time() <= p.start_time()).then_some(pp)
 }
 
+/// Like `refresh_all`, except exited processes are dropped. sysinfo 0.32's
+/// `refresh_all` keeps them forever, which left ghost rows that couldn't be ended.
+fn refresh_sys(sys: &mut System) {
+    sys.refresh_memory();
+    sys.refresh_cpu_all();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::everything());
+}
+
 fn sample(m: &mut Monitor, bandwidth: Option<&etw::Counters>, gpu: &gpu::Sample, sigs: &sig::Cache, wanted: &sig::Wanted) -> Snapshot {
-    m.sys.refresh_all();
+    refresh_sys(&mut m.sys);
     m.nets.refresh();
 
     let now = Instant::now();
@@ -241,8 +249,7 @@ fn sampler(app: AppHandle, shared: Shared) {
                 &shared.sigs,
                 &shared.sig_wanted,
             );
-            let sys = &m.sys;
-            let kill = |pid: u32| can_kill(pid) && sys.process(Pid::from_u32(pid)).is_some_and(|p| p.kill());
+            let kill = |pid: u32| can_kill(pid) && win::terminate(pid).is_ok();
             shared.rules.lock().unwrap().run(&snap.procs, &app, &kill);
             snap
         };
@@ -356,9 +363,17 @@ async fn details(state: State<'_, Shared>, pid: u32) -> Result<Details, String> 
     })
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KillOutcome {
+    ended: usize,
+    gone: usize,
+    denied: Vec<String>,
+}
+
 /// Kill one process, or it and all its descendants (children first).
 #[tauri::command]
-async fn kill(state: State<'_, Shared>, pids: Vec<u32>, tree: bool) -> Result<usize, String> {
+async fn kill(state: State<'_, Shared>, pids: Vec<u32>, tree: bool) -> Result<KillOutcome, String> {
     let m = state.monitor.lock().map_err(|e| e.to_string())?;
     let mut targets: Vec<u32> = pids.into_iter().filter(|&p| can_kill(p)).collect();
     if targets.is_empty() {
@@ -386,16 +401,17 @@ async fn kill(state: State<'_, Shared>, pids: Vec<u32>, tree: bool) -> Result<us
         targets.reverse();
     }
 
-    let killed = targets
-        .iter()
-        .filter(|&&t| m.sys.process(Pid::from_u32(t)).is_some_and(|p| p.kill()))
-        .count();
-
-    if killed == 0 {
-        Err("Couldn't end it: access denied or it already exited. Try running as admin.".into())
-    } else {
-        Ok(killed)
+    let mut out = KillOutcome { ended: 0, gone: 0, denied: Vec::new() };
+    for &t in &targets {
+        let name = || m.sys.process(Pid::from_u32(t)).map(|p| lossy(p.name())).unwrap_or_else(|| format!("PID {t}"));
+        match win::terminate(t) {
+            Ok(()) => out.ended += 1,
+            Err(win::KillError::Gone) => out.gone += 1,
+            Err(win::KillError::Denied) => out.denied.push(name()),
+            Err(win::KillError::Other(code)) => out.denied.push(format!("{} (error {code})", name())),
+        }
     }
+    Ok(out)
 }
 
 #[tauri::command]
@@ -523,7 +539,7 @@ fn main() {
     let start_hidden = std::env::args().any(|a| a == autostart::MINIMIZED_FLAG);
 
     let mut sys = System::new_all();
-    sys.refresh_all();
+    refresh_sys(&mut sys);
     let monitor = Arc::new(Mutex::new(Monitor {
         sys,
         nets: Networks::new_with_refreshed_list(),
@@ -623,4 +639,46 @@ fn main() {
             etw::stop();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::{Child, Command, Stdio};
+
+    /// A harmless process we own and can end.
+    fn spawn_sleeper() -> Child {
+        Command::new("ping").args(["-n", "30", "127.0.0.1"]).stdout(Stdio::null()).spawn().expect("spawn ping")
+    }
+
+    #[test]
+    fn exited_processes_leave_the_list() {
+        let mut sys = System::new();
+        let mut child = spawn_sleeper();
+        let pid = Pid::from_u32(child.id());
+        refresh_sys(&mut sys);
+        assert!(sys.process(pid).is_some(), "new process isn't listed");
+
+        assert_eq!(win::terminate(child.id()), Ok(()));
+        child.wait().unwrap();
+        drop(child);
+        refresh_sys(&mut sys);
+        // The PID could in theory be reused already, so only fail if it's still our ping.
+        let ghost = sys.process(pid).is_some_and(|p| lossy(p.name()).eq_ignore_ascii_case("ping.exe"));
+        assert!(!ghost, "exited process is still listed");
+    }
+
+    #[test]
+    fn ending_an_exited_process_reports_gone() {
+        let mut child = spawn_sleeper();
+        assert_eq!(win::terminate(child.id()), Ok(()));
+        // Holding the handle keeps the dead process (and its PID) around, so this is safe to retry.
+        child.wait().unwrap();
+        assert_eq!(win::terminate(child.id()), Err(win::KillError::Gone));
+    }
+
+    #[test]
+    fn missing_pid_reports_gone() {
+        assert_eq!(win::terminate(0x7FFF_FFFC), Err(win::KillError::Gone));
+    }
 }

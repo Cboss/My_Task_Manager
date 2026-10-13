@@ -1,6 +1,6 @@
 [package]
 name = "overseer"
-version = "0.3.0"
+version = "0.3.1"
 description = "A fast, keyboard-first task manager for Windows"
 edition = "2021"
 

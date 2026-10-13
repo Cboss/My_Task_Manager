@@ -6,12 +6,12 @@ use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 
-use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
 use windows_sys::Win32::System::Threading::{
-    GetPriorityClass, OpenProcess, SetPriorityClass, WaitForSingleObject, ABOVE_NORMAL_PRIORITY_CLASS,
-    BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_SYNCHRONIZE,
-    REALTIME_PRIORITY_CLASS,
+    GetExitCodeProcess, GetPriorityClass, OpenProcess, SetPriorityClass, TerminateProcess, WaitForSingleObject,
+    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS,
+    NORMAL_PRIORITY_CLASS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE, REALTIME_PRIORITY_CLASS,
 };
 use windows_sys::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
 
@@ -74,6 +74,47 @@ pub fn reveal_in_explorer(path: &Path) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, PartialEq)]
+pub enum KillError {
+    /// The process has already exited.
+    Gone,
+    /// Windows refused: elevated, protected, or a system process.
+    Denied,
+    Other(u32),
+}
+
+const STILL_ACTIVE: u32 = 259;
+const ERROR_ACCESS_DENIED: u32 = 5;
+const ERROR_INVALID_PARAMETER: u32 = 87; // what OpenProcess returns for a PID that doesn't exist
+
+/// End a process with TerminateProcess, reporting why it failed if it did.
+pub fn terminate(pid: u32) -> Result<(), KillError> {
+    unsafe {
+        let h = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return Err(match GetLastError() {
+                ERROR_INVALID_PARAMETER => KillError::Gone,
+                ERROR_ACCESS_DENIED => KillError::Denied,
+                e => KillError::Other(e),
+            });
+        }
+        // An exited process lingers while anyone holds a handle to it; don't call that "denied".
+        let mut code = 0u32;
+        let result = if GetExitCodeProcess(h, &mut code) != 0 && code != STILL_ACTIVE {
+            Err(KillError::Gone)
+        } else if TerminateProcess(h, 1) != 0 {
+            Ok(())
+        } else {
+            Err(match GetLastError() {
+                ERROR_ACCESS_DENIED => KillError::Denied,
+                e => KillError::Other(e),
+            })
+        };
+        CloseHandle(h);
+        result
+    }
 }
 
 pub fn open_url(url: &str) -> Result<(), String> {

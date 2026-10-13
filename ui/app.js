@@ -401,9 +401,18 @@ async function endSelected(tree) {
   const what = state.sel.group ? `all ${pids.length} "${name}" processes` : tree ? `${name} and all its child processes` : name;
   if (!(await confirmBox(`End ${tree ? "process tree" : "task"}?`, `This will end ${what}. Unsaved work will be lost.`))) return;
   try {
-    const n = await invoke("kill", { pids, tree });
-    toast(`Ended ${n} process${n === 1 ? "" : "es"}`);
-    select(null);
+    const r = await invoke("kill", { pids, tree });
+    const plural = (n) => `${n} process${n === 1 ? "" : "es"}`;
+    if (r.denied.length) {
+      const who = r.denied.slice(0, 3).join(", ") + (r.denied.length > 3 ? ` and ${r.denied.length - 3} more` : "");
+      const hint = state.info?.admin ? "Some protected Windows processes can't be ended at all." : "Restart Overseer as admin and try again.";
+      toast(`${r.ended ? `Ended ${plural(r.ended)}, but ` : ""}Windows denied access to ${who}. ${hint}`, true);
+    } else if (r.ended) {
+      toast(`Ended ${plural(r.ended)}${r.gone ? ` (${r.gone} had already exited)` : ""}`);
+    } else {
+      toast("It had already exited.");
+    }
+    if (r.ended || r.gone) select(null);
     tick(true);
   } catch (e) { toast(e, true); }
 }
@@ -1098,7 +1107,7 @@ function mockInvoke(cmd, args) {
     const p = m.procs.find((x) => x.pid === args.pid); const par = m.procs.find((x) => x.pid === p?.parent);
     return Promise.resolve({ pid: p.pid, name: p.name, exe: `C:\\Program Files\\${p.name.replace(".exe", "")}\\${p.name}`, cmd: `"${p.name}" --type=renderer`, cwd: "C:\\Users\\you", parent: par?.pid ?? null, parentName: par?.name, status: "Run", startTime: Date.now() / 1000 - 5000, runTime: 5000, virt: 2.1e9, priority: "normal" });
   }
-  if (cmd === "kill") return Promise.resolve(args.pids.length);
+  if (cmd === "kill") return Promise.resolve({ ended: args.pids.length, gone: 0, denied: [] });
   if (cmd === "set_priority" || cmd === "set_startup" || cmd === "open_virustotal") return Promise.resolve();
   if (cmd === "services_list") return Promise.resolve(m.services.map((s) => ({ ...s })));
   if (cmd === "service_control") {
