@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Overseer</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo"></span>
+      <div>
+        <div class="brand-name">Overseer</div>
+        <div class="brand-sub" id="sysline">…</div>
+      </div>
+    </div>
+
+    <div class="search">
+      <svg viewBox="0 0 24 24" width="16" height="16"><path d="M10 4a6 6 0 1 0 3.9 10.6l4.7 4.7 1.4-1.4-4.7-4.7A6 6 0 0 0 10 4zm0 2a4 4 0 1 1 0 8 4 4 0 0 1 0-8z" fill="currentColor"/></svg>
+      <input id="search" placeholder="Filter by name or PID" autocomplete="off" spellcheck="false" />
+      <kbd>/</kbd>
+    </div>
+
+    <div class="segmented" id="modes">
+      <button data-mode="list" class="on" title="Flat list (1)">List</button>
+      <button data-mode="tree" title="Process tree (2)">Tree</button>
+      <button data-mode="group" title="Group by name (3)">Grouped</button>
+    </div>
+
+    <button class="icon-btn" id="pause" title="Pause updates (Space)">❚❚</button>
+    <button class="badge" id="admin" title="">…</button>
+  </header>
+
+  <section class="metrics">
+    <div class="card" data-k="cpu">
+      <div class="card-head"><span>CPU</span><b id="m-cpu">–</b></div>
+      <canvas id="c-cpu"></canvas>
+      <div class="cores" id="cores"></div>
+    </div>
+    <div class="card" data-k="mem">
+      <div class="card-head"><span>Memory</span><b id="m-mem">–</b></div>
+      <canvas id="c-mem"></canvas>
+      <div class="card-sub" id="m-mem-sub">–</div>
+    </div>
+    <div class="card" data-k="disk">
+      <div class="card-head"><span>Disk I/O</span><b id="m-disk">–</b></div>
+      <canvas id="c-disk"></canvas>
+      <div class="card-sub" id="m-disk-sub">–</div>
+    </div>
+    <div class="card" data-k="net">
+      <div class="card-head"><span>Network</span><b id="m-net">–</b></div>
+      <canvas id="c-net"></canvas>
+      <div class="card-sub" id="m-net-sub">–</div>
+    </div>
+  </section>
+
+  <main class="body">
+    <div class="table-wrap">
+      <table id="procs">
+        <thead>
+          <tr>
+            <th data-sort="name" class="col-name">Name</th>
+            <th data-sort="pid" class="num">PID</th>
+            <th data-sort="cpu" class="num">CPU</th>
+            <th data-sort="mem" class="num">Memory</th>
+            <th data-sort="diskRead" class="num">Disk read</th>
+            <th data-sort="diskWrite" class="num">Disk write</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <aside class="panel" id="panel" hidden>
+      <div class="panel-head">
+        <div>
+          <div class="panel-title" id="d-name"></div>
+          <div class="panel-sub" id="d-sub"></div>
+        </div>
+        <button class="icon-btn" id="d-close" title="Close (Esc)">✕</button>
+      </div>
+      <div class="live">
+        <div><span>CPU</span><b id="d-cpu">–</b></div>
+        <div><span>Memory</span><b id="d-mem">–</b></div>
+        <div><span>Disk</span><b id="d-disk">–</b></div>
+      </div>
+      <dl id="d-props"></dl>
+      <label class="field" id="d-prio-wrap">
+        <span>Priority</span>
+        <select id="d-prio">
+          <option value="idle">Low</option>
+          <option value="below">Below normal</option>
+          <option value="normal">Normal</option>
+          <option value="above">Above normal</option>
+          <option value="high">High</option>
+          <option value="realtime">Realtime</option>
+        </select>
+      </label>
+      <div class="actions">
+        <button class="btn danger" id="d-kill">End task <kbd>Del</kbd></button>
+        <button class="btn danger ghost" id="d-killtree">End tree <kbd>⇧Del</kbd></button>
+        <button class="btn" id="d-open">Open file location</button>
+      </div>
+    </aside>
+  </main>
+
+  <footer class="status" id="status">
+    <span id="s-count">–</span>
+    <span id="s-uptime">–</span>
+    <span class="hint">/ search · 1 2 3 views · Space pause · Del end task · Esc clear</span>
+  </footer>
+
+  <div class="modal" id="modal" hidden>
+    <div class="modal-box">
+      <div class="modal-title" id="modal-title"></div>
+      <div class="modal-body" id="modal-body"></div>
+      <div class="modal-actions">
+        <button class="btn" id="modal-no">Cancel</button>
+        <button class="btn danger" id="modal-yes">End</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

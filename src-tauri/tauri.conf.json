@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Overseer",
+  "version": "0.1.0",
+  "identifier": "dev.overseer.app",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Overseer",
+        "width": 1320,
+        "height": 840,
+        "minWidth": 960,
+        "minHeight": 600,
+        "backgroundColor": "#0b0d12"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.png", "icons/icon.ico"]
+  }
+}
