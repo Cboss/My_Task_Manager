@@ -18,10 +18,11 @@
 
     <nav class="tabs" id="tabs">
       <button data-tab="procs" class="on" title="Ctrl+1">Processes</button>
-      <button data-tab="history" title="Ctrl+2">History</button>
-      <button data-tab="services" title="Ctrl+3">Services</button>
-      <button data-tab="startup" title="Ctrl+4">Startup</button>
-      <button data-tab="rules" title="Ctrl+5">Rules <span class="pill" id="rules-count" hidden></span></button>
+      <button data-tab="diagnose" title="Ctrl+2: why is my PC slow?">Diagnose</button>
+      <button data-tab="history" title="Ctrl+3">History</button>
+      <button data-tab="services" title="Ctrl+4">Services</button>
+      <button data-tab="startup" title="Ctrl+5">Startup</button>
+      <button data-tab="rules" title="Ctrl+6">Rules <span class="pill" id="rules-count" hidden></span></button>
     </nav>
 
     <div class="search">
@@ -36,7 +37,9 @@
       <button data-mode="group" title="Group by name (3)">Grouped</button>
     </div>
 
+    <button class="icon-btn" id="export" title="Export this tab to CSV (Ctrl+E)">⤓</button>
     <button class="icon-btn" id="pause" title="Pause updates (Space)">❚❚</button>
+    <button class="update-btn" id="update" hidden></button>
     <button class="badge" id="admin" title="">…</button>
   </header>
 
@@ -128,11 +131,43 @@
         <button class="btn danger ghost" id="d-killtree">End tree <kbd>⇧Del</kbd></button>
         <button class="btn" id="d-open">Open file location</button>
       </div>
+      <div class="conns" id="d-files-wrap">
+        <div class="section-title">File activity <span class="hint-line">last 10 s</span></div>
+        <div id="d-files"></div>
+      </div>
       <div class="conns" id="d-conns-wrap">
         <div class="section-title">Connections <span id="d-conns-count"></span></div>
         <div id="d-conns"></div>
       </div>
     </aside>
+  </main>
+
+  <main class="body single column" id="view-diagnose" hidden>
+    <section class="verdict" id="dx-verdict">
+      <div class="verdict-icon" id="dx-icon">…</div>
+      <div>
+        <div class="verdict-title" id="dx-title">Checking…</div>
+        <div class="verdict-text" id="dx-text"></div>
+      </div>
+    </section>
+    <div class="dx-grid">
+      <section class="dx-card">
+        <div class="section-title">Pressure <span class="hint-line">last 30 s</span></div>
+        <div id="dx-gauges"></div>
+      </section>
+      <section class="dx-card dx-wide">
+        <div class="section-title">Biggest impact right now <span class="hint-line">apps with several processes are added together</span></div>
+        <div id="dx-offenders"></div>
+      </section>
+      <section class="dx-card">
+        <div class="section-title">Busiest files</div>
+        <div id="dx-files"></div>
+      </section>
+      <section class="dx-card dx-wide">
+        <div class="section-title">Also worth knowing</div>
+        <div id="dx-tips"></div>
+      </section>
+    </div>
   </main>
 
   <main class="body" id="view-history" hidden>
@@ -270,7 +305,7 @@
     <span id="s-bw">–</span>
     <button class="chip" id="s-unsigned" hidden></button>
     <span id="s-hotkey"></span>
-    <span class="hint">Ctrl+1–5 tabs · / search · 1 2 3 views · Space pause · Del end task · Esc clear</span>
+    <span class="hint">Ctrl+1–6 tabs · / search · 1 2 3 views · Space pause · Del end task · Ctrl+E export · Esc clear</span>
   </footer>
 
   <div class="modal" id="modal" hidden>

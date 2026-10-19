@@ -249,17 +249,50 @@ async function select(sel) {
   state.sel = sel;
   state.details = null;
   state.conns = null;
+  state.files = null;
   state.hash = null;
   renderTable();
   if (!sel) { $("panel").hidden = true; return; }
   $("panel").hidden = false;
   renderConns();
+  renderFiles();
   if (sel.pid != null) {
     try { state.details = await invoke("details", { pid: sel.pid }); }
     catch (e) { toast(e, true); }
     refreshConns();
+    refreshFiles();
   }
   renderPanel();
+}
+
+// ---------- file activity (ETW, admin only) ----------
+async function refreshFiles() {
+  const pid = state.sel?.pid;
+  if (pid == null || !state.snap?.bandwidth) return renderFiles();
+  try {
+    const rows = await invoke("file_activity", { pid });
+    if (state.sel?.pid === pid) { state.files = rows; renderFiles(); }
+  } catch (e) { /* process may have exited */ }
+}
+
+function fileRowsHtml(rows, withWho) {
+  const names = new Map((state.snap?.procs || []).map((p) => [p.pid, p.name]));
+  return rows.map((r) =>
+    `<div class="file-row"><span class="path${r.path.startsWith("(") ? " unknown" : ""}">${esc(r.path)}</span>` +
+    `<span class="rate">${r.read >= 1 ? `R ${fmtRate(r.read)}` : ""}${r.read >= 1 && r.write >= 1 ? " · " : ""}${r.write >= 1 ? `W ${fmtRate(r.write)}` : ""}</span>` +
+    (withWho ? `<span class="who">${esc(names.get(r.pid) || "exited")} (${r.pid}) · ${r.ops} ops</span>` : "") + `</div>`).join("");
+}
+
+function renderFiles() {
+  const wrap = $("d-files-wrap");
+  wrap.hidden = state.sel?.pid == null;
+  if (wrap.hidden) return;
+  const box = $("d-files");
+  if (!state.snap?.bandwidth) { box.innerHTML = `<div class="hint-line">Needs admin. Click "● Limited" in the top bar.</div>`; return; }
+  const rows = state.files;
+  box.innerHTML = !rows ? `<div class="hint-line">Loading…</div>`
+    : !rows.length ? `<div class="hint-line">No file reads or writes in the last 10 seconds.</div>`
+    : fileRowsHtml(rows.slice(0, 12), false);
 }
 
 async function refreshConns() {
@@ -435,7 +468,7 @@ function setMode(m) {
 }
 
 // ---------- tabs ----------
-const TABS = ["procs", "history", "services", "startup", "rules"];
+const TABS = ["procs", "diagnose", "history", "services", "startup", "rules"];
 const SEARCH_PLACEHOLDER = { procs: "Filter by name or PID", services: "Filter services", startup: "Filter startup apps" };
 
 function setTab(tab) {
@@ -449,6 +482,7 @@ function setTab(tab) {
   if (tab === "startup") { loadStartup(); loadAutostart(); }
   if (tab === "services") loadServices();
   if (tab === "history") loadHistory();
+  if (tab === "diagnose") openDiagnose();
 }
 
 function rerenderActive() {
@@ -457,6 +491,267 @@ function rerenderActive() {
   else if (state.tab === "services") renderServices();
   else if (state.tab === "rules") renderRules();
 }
+
+// ---------- diagnose ("why is my PC slow?") ----------
+const dx = { apps: new Map(), files: null, startupOn: null };
+
+// Average of the last `secs` seconds of history (falls back to the live value).
+function recentAvg(key, secs, live) {
+  const since = hv.lastT - secs * 1000;
+  const pts = hv.points.filter((p) => p.t >= since);
+  return pts.length ? pts.reduce((a, p) => a + p[key], 0) / pts.length : live;
+}
+
+// Resources that can be a bottleneck, with [elevated, high] thresholds in %.
+// Network has no fixed ceiling we can measure, so it's ranked but never called a bottleneck.
+const PRESSURE = [
+  { key: "cpu", label: "CPU", color: () => COLORS.cpu, warn: 75, bad: 90,
+    why: "The processor is maxed out, so everything waits its turn. Ending or lowering the priority of the top CPU users below frees it up." },
+  { key: "mem", label: "Memory", color: () => COLORS.mem, warn: 85, bad: 92,
+    why: "Windows is nearly out of RAM and is swapping to disk, which makes every app sluggish. Closing the biggest memory users below helps right away." },
+  { key: "diskBusy", label: "Disk", color: () => COLORS.disk, warn: 70, bad: 90,
+    why: "The disk is busy nearly all the time, so apps stall while loading files. The busiest files show who's hammering it." },
+  { key: "gpu", label: "GPU", color: () => COLORS.gpu, warn: 85, bad: 95,
+    why: "The graphics card is at its limit. Games, video and animation-heavy browser tabs are the usual culprits." },
+];
+
+function systemSummary(s) {
+  return {
+    cpu: recentAvg("cpu", 30, s.cpu),
+    mem: (s.memUsed / s.memTotal) * 100,
+    memTotal: s.memTotal,
+    gpu: recentAvg("gpu", 30, s.gpu),
+    diskBusy: recentAvg("diskBusy", 30, s.diskBusy),
+    disk: s.diskRead + s.diskWrite,
+    net: s.netRx + s.netTx,
+  };
+}
+
+// Chrome alone can be 30 processes; judge apps, not fragments.
+function groupApps(procs) {
+  const apps = new Map();
+  for (const p of procs) {
+    let a = apps.get(p.name);
+    if (!a) apps.set(p.name, (a = { name: p.name, pids: [], cpu: 0, gpu: 0, mem: 0, disk: 0, net: 0 }));
+    a.pids.push(p.pid);
+    a.cpu += p.cpu;
+    a.mem += p.mem;
+    a.disk += p.diskRead + p.diskWrite;
+    a.net += p.net;
+    a.gpu = Math.max(a.gpu, p.gpu); // GPU % is per-engine, so summing could pass 100
+  }
+  return [...apps.values()];
+}
+
+// How much is this app slowing the PC down, on a 0–100 scale?
+//   app: { name, pids, cpu %, gpu %, mem bytes, disk bytes/s, net bytes/s }
+//   sys: { cpu %, mem % used, memTotal bytes, gpu %, diskBusy %, disk bytes/s, net bytes/s }
+function impactScore(app, sys) {
+  const clamp01 = (x) => Math.min(1, Math.max(0, x));
+  // How stretched a resource is: 0.25 while it has headroom (<50%), rising to 1 at its "bottleneck" threshold.
+  const pressure = (key, used) => 0.25 + 0.75 * clamp01((used - 50) / (PRESSURE.find((r) => r.key === key).bad - 50));
+  const terms = [
+    (app.cpu / 100) * pressure("cpu", sys.cpu),
+    clamp01((2 * app.mem) / sys.memTotal) * pressure("mem", sys.mem), // a quarter of RAM already counts as half
+    (app.gpu / 100) * pressure("gpu", sys.gpu),
+    // Share of disk throughput × how busy the disk is ≈ share of disk time; on an idle disk it's near zero.
+    (sys.disk > 0 ? app.disk / sys.disk : 0) * (sys.diskBusy / 100),
+    clamp01(app.net / 12.5e6) * 0.5, // no known ceiling: 100 Mbit/s counts as half
+  ];
+  // Mostly the worst resource, plus a little for everything else it's using.
+  const worst = Math.max(...terms);
+  return 100 * (worst + 0.25 * (terms.reduce((a, b) => a + b, 0) - worst));
+}
+
+async function openDiagnose() {
+  await loadHistory(false);
+  renderDiagnose();
+  refreshDxFiles();
+  try {
+    const items = await invoke("startup_items");
+    dx.startupOn = items.filter((i) => i.enabled).length;
+  } catch { dx.startupOn = null; }
+  renderDiagnose();
+}
+
+async function refreshDxFiles() {
+  if (!state.snap?.bandwidth) { dx.files = null; return; }
+  try { dx.files = await invoke("file_activity", { pid: null }); } catch { dx.files = null; }
+}
+
+function renderDiagnose() {
+  const s = state.snap;
+  if (!s || state.tab !== "diagnose") return;
+  const sys = systemSummary(s);
+
+  // Verdict: the resource furthest past its threshold.
+  const levels = PRESSURE.map((r) => ({ ...r, v: sys[r.key], level: sys[r.key] >= r.bad ? 2 : sys[r.key] >= r.warn ? 1 : 0 }));
+  const worst = [...levels].sort((a, b) => b.level - a.level || b.v / b.bad - a.v / a.bad)[0];
+  if (worst.level === 0) {
+    $("dx-verdict").className = "verdict ok";
+    $("dx-icon").textContent = "✓";
+    $("dx-title").textContent = "Nothing is maxed out right now";
+    $("dx-text").textContent = "CPU, memory, disk and GPU all have headroom. If it felt slow a moment ago, the History tab shows what spiked.";
+  } else {
+    const others = levels.filter((l) => l.level && l !== worst).map((l) => l.label);
+    $("dx-verdict").className = `verdict ${worst.level === 2 ? "bad" : "warn"}`;
+    $("dx-icon").textContent = "!";
+    $("dx-title").textContent = `${worst.label} is ${worst.level === 2 ? "the bottleneck" : "under pressure"} (${worst.v.toFixed(0)}%)`;
+    $("dx-text").textContent = worst.why + (others.length ? ` ${others.join(" and ")} ${others.length > 1 ? "are" : "is"} also under pressure.` : "");
+  }
+
+  $("dx-gauges").innerHTML = levels.map((l) => {
+    const color = l.level === 2 ? "var(--danger)" : l.level ? "var(--disk)" : l.color();
+    return `<div class="gauge"><div class="gauge-head"><span>${l.label}</span><b>${l.v.toFixed(0)}%</b></div>` +
+      `<div class="gauge-bar"><i style="width:${Math.min(100, l.v)}%;background:${color}"></i></div></div>`;
+  }).join("") + `<div class="hint-line">Disk is "active time", like Task Manager's disk graph.</div>`;
+
+  // Offenders, ranked by impactScore.
+  const apps = groupApps(s.procs)
+    .map((a) => ({ ...a, score: Math.max(0, Math.min(100, impactScore(a, sys) || 0)) }))
+    .filter((a) => a.score >= 1)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 7);
+  dx.apps = new Map(apps.map((a) => [a.name, a]));
+  $("dx-offenders").innerHTML = apps.length ? apps.map((a) => {
+    const chips = [
+      [a.cpu >= 5, `CPU ${a.cpu.toFixed(0)}%`, a.cpu >= 25],
+      [a.mem >= 300 * 2 ** 20, `RAM ${fmtBytes(a.mem)}`, a.mem / sys.memTotal >= 0.1],
+      [a.disk >= 2 ** 20, `Disk ${fmtRate(a.disk)}`, a.disk >= 20 * 2 ** 20],
+      [a.gpu >= 5, `GPU ${a.gpu.toFixed(0)}%`, a.gpu >= 40],
+      [a.net >= 512 * 1024, `Net ${fmtRate(a.net)}`, a.net >= 5 * 2 ** 20],
+    ].filter((c) => c[0]).map(([, text, hot]) => `<span class="${hot ? "hot" : ""}">${text}</span>`).join("") || "<span>light on everything</span>";
+    return `<div class="offender" data-name="${esc(a.name)}">` +
+      `<div><div class="who">${esc(a.name)}${a.pids.length > 1 ? ` <span class="count">×${a.pids.length}</span>` : ""}</div>` +
+      `<div class="score" title="Impact ${a.score.toFixed(0)} / 100"><i style="width:${a.score}%"></i></div></div>` +
+      `<div class="chips">${chips}</div>` +
+      `<div class="acts"><button class="btn small" data-dx="show">Show</button>` +
+      `<button class="btn small" data-dx="lower" title="Set all of its processes to below-normal priority">Lower priority</button>` +
+      `<button class="btn small danger" data-dx="end">End</button></div></div>`;
+  }).join("") : `<div class="hint-line">Nothing is using a noticeable amount of anything.</div>`;
+
+  $("dx-files").innerHTML = !s.bandwidth ? `<div class="hint-line">Needs admin. <a class="link" data-dx-elevate>Restart as admin</a> to see which files are being read and written.</div>`
+    : !dx.files ? `<div class="hint-line">Loading…</div>`
+    : !dx.files.length ? `<div class="hint-line">No file reads or writes in the last 10 seconds.</div>`
+    : fileRowsHtml(dx.files.slice(0, 8), true);
+
+  const tips = [];
+  const days = s.uptime / 86400;
+  if (days >= 3) tips.push(`Your PC has been on for ${Math.floor(days)} days. A restart clears leaked memory and finishes pending updates.`);
+  if (dx.startupOn != null) tips.push(`${dx.startupOn} app${dx.startupOn === 1 ? "" : "s"} start with Windows. Turning off ones you don't need speeds up sign-in. <a data-dx-tab="startup">Open Startup</a>`);
+  const spike = hv.points.filter((p) => p.t >= hv.lastT - 600_000).reduce((m, p) => (!m || p.cpu > m.cpu ? p : m), null);
+  if (spike && spike.cpu >= 50) tips.push(`Biggest CPU spike in the last 10 minutes: ${spike.cpu.toFixed(0)}% at ${clock(spike.t)}, mostly ${esc(spike.top)}. <a data-dx-spike="${spike.t}">See it in History</a>`);
+  if (!s.bandwidth) tips.push(`Running without admin, so per-app network and file activity are hidden. <a data-dx-elevate>Restart as admin</a>`);
+  $("dx-tips").innerHTML = tips.length ? tips.map((t) => `<div class="tip">${t}</div>`).join("") : `<div class="hint-line">Nothing else stands out.</div>`;
+}
+
+$("view-diagnose").addEventListener("click", async (e) => {
+  if (e.target.closest("[data-dx-elevate]")) return $("admin").click();
+  const tabLink = e.target.closest("[data-dx-tab]");
+  if (tabLink) return setTab(tabLink.dataset.dxTab);
+  const spikeLink = e.target.closest("[data-dx-spike]");
+  if (spikeLink) {
+    setTab("history");
+    hv.pinned = true; hv.cursor = +spikeLink.dataset.dxSpike;
+    renderHistory(); fetchMoment(hv.cursor);
+    return;
+  }
+  const btn = e.target.closest("[data-dx]");
+  const app = btn && dx.apps.get(btn.closest(".offender").dataset.name);
+  if (!app) return;
+  if (btn.dataset.dx === "show") {
+    setTab("procs");
+    $("search").value = app.name; state.filter = app.name.toLowerCase();
+    renderTable();
+  } else if (btn.dataset.dx === "lower") {
+    const results = await Promise.allSettled(app.pids.map((pid) => invoke("set_priority", { pid, level: "below" })));
+    const ok = results.filter((r) => r.status === "fulfilled").length;
+    toast(ok ? `Lowered priority of ${ok} ${app.name} process${ok === 1 ? "" : "es"}` : `Couldn't change ${app.name}'s priority (try admin)`, !ok);
+  } else if (btn.dataset.dx === "end") {
+    if (!(await confirmBox(`End ${app.name}?`, `This ends all ${app.pids.length} of its processes. Unsaved work will be lost.`))) return;
+    try {
+      const r = await invoke("kill", { pids: app.pids, tree: false });
+      toast(r.denied.length ? `Windows denied access to ${r.denied.slice(0, 3).join(", ")}` : `Ended ${app.name}`, !!r.denied.length);
+    } catch (err) { toast(err, true); }
+  }
+});
+
+// ---------- CSV export ----------
+const csvField = (v) => {
+  const s = v == null ? "" : String(v);
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+const toCsv = (header, rows) => [header, ...rows].map((r) => r.map(csvField).join(",")).join("\r\n") + "\r\n";
+const localTime = (t) => new Date(t).toLocaleString("sv-SE"); // "2026-10-19 03:29:00", sorts and parses well
+
+function exportData() {
+  const stamp = localTime(Date.now()).replace(/[: ]/g, "-");
+  const mb = (b) => (b / 2 ** 20).toFixed(1);
+  switch (state.tab) {
+    case "procs":
+    case "diagnose": {
+      const procs = state.snap?.procs || [];
+      return [`overseer-processes-${stamp}.csv`, procs.length, toCsv(
+        ["PID", "Parent PID", "Name", "CPU %", "GPU %", "Memory MB", "Disk read B/s", "Disk write B/s", "Net down B/s", "Net up B/s", "Connections", "Signature", "Signer"],
+        procs.map((p) => [p.pid, p.parent ?? "", p.name, p.cpu.toFixed(1), p.gpu.toFixed(1), mb(p.mem), Math.round(p.diskRead), Math.round(p.diskWrite),
+          Math.round(p.netRx), Math.round(p.netTx), p.conns, p.sig ?? "", p.signer ?? ""]))];
+    }
+    case "history": {
+      const { pts } = visiblePoints();
+      return [`overseer-history-${hv.range}min-${stamp}.csv`, pts.length, toCsv(
+        ["Time", "CPU %", "Memory %", "GPU %", "Disk busy %", "Disk B/s", "Network B/s", "Top process", "Top process CPU %"],
+        pts.map((p) => [localTime(p.t), p.cpu.toFixed(1), p.mem.toFixed(1), p.gpu.toFixed(1), (p.diskBusy ?? 0).toFixed(1), Math.round(p.disk), Math.round(p.net), p.top, p.topCpu.toFixed(1)]))];
+    }
+    case "services":
+      return [`overseer-services-${stamp}.csv`, svc.list?.length || 0, toCsv(
+        ["Name", "Display name", "Status", "Startup type", "PID", "Account", "Path", "Description"],
+        (svc.list || []).map((s) => [s.name, s.display, s.state, s.startType, s.pid || "", s.account, s.path, s.description]))];
+    case "startup":
+      return [`overseer-startup-${stamp}.csv`, state.startup?.length || 0, toCsv(
+        ["Name", "Enabled", "Location", "Command"],
+        (state.startup || []).map((i) => [i.name, i.enabled ? "yes" : "no", i.location, i.command]))];
+    case "rules":
+      return [`overseer-rules-${stamp}.csv`, rules.list.length, toCsv(
+        ["Process name contains", "Metric", "Threshold", "For seconds", "Action", "Enabled"],
+        rules.list.map((r) => [r.match, r.metric, r.threshold, r.duration, r.action, r.enabled ? "yes" : "no"]))];
+  }
+  return null;
+}
+
+async function exportCurrent() {
+  const data = exportData();
+  if (!data || !data[1]) return toast("Nothing to export on this tab yet.", true);
+  const [name, rows, contents] = data;
+  try {
+    const path = await invoke("save_csv", { name, contents });
+    if (path) toast(`Saved ${rows} rows to ${path}`);
+  } catch (e) { toast(e, true); }
+}
+$("export").addEventListener("click", exportCurrent);
+
+// ---------- updates ----------
+async function checkUpdateStatus() {
+  try {
+    const u = await invoke("update_status");
+    const b = $("update");
+    b.hidden = !u;
+    if (u) {
+      b.textContent = `⬆ Update to ${u.version}`;
+      b.dataset.version = u.version;
+      b.title = u.notes || "A new version of Overseer is available";
+    }
+  } catch { /* updater unavailable */ }
+}
+
+$("update").addEventListener("click", async () => {
+  const b = $("update");
+  const v = b.dataset.version;
+  if (!(await confirmBox(`Update to Overseer ${v}?`, "Overseer downloads the update, checks its signature, then closes, installs it, and starts again. It takes a few seconds.", "Update now"))) return;
+  b.disabled = true;
+  b.textContent = "Downloading…";
+  try { await invoke("install_update"); }
+  catch (e) { toast(e, true); b.disabled = false; checkUpdateStatus(); }
+});
 
 // ---------- services ----------
 const svc = { list: null, filter: "all", sort: "display", busy: new Set() };
@@ -575,7 +870,7 @@ const H_METRICS = {
 };
 const hv = { points: [], lastT: 0, range: 10, cursor: null, pinned: false, moment: null, momentT: null };
 
-async function loadHistory() {
+async function loadHistory(withMoment = true) {
   try {
     const pts = await invoke("history_since", { t: hv.lastT });
     if (pts.length) {
@@ -585,7 +880,7 @@ async function loadHistory() {
     }
   } catch (e) { toast(e, true); }
   renderHistory();
-  if (!hv.pinned && hv.cursor == null) fetchMoment(hv.lastT);
+  if (withMoment && !hv.pinned && hv.cursor == null) fetchMoment(hv.lastT);
 }
 
 function visiblePoints() {
@@ -953,7 +1248,8 @@ function togglePause() {
 
 document.addEventListener("keydown", (e) => {
   if (!$("modal").hidden) return;
-  if (e.ctrlKey && /^[1-5]$/.test(e.key)) { e.preventDefault(); setTab(TABS[+e.key - 1]); return; }
+  if (e.ctrlKey && /^[1-6]$/.test(e.key)) { e.preventDefault(); setTab(TABS[+e.key - 1]); return; }
+  if (e.ctrlKey && e.key.toLowerCase() === "e") { e.preventDefault(); exportCurrent(); return; }
   if (e.target.matches("input:not(#search), select")) return; // typing in the rules form
   const typing = e.target === $("search");
   if ((e.key === "/" && !typing) || (e.key === "f" && e.ctrlKey)) { e.preventDefault(); $("search").focus(); $("search").select(); return; }
@@ -982,9 +1278,11 @@ document.addEventListener("keydown", (e) => {
 // ---------- loop ----------
 let ticking = false;
 let tickCount = 0;
+let beat = 0;
 async function tick(force = false) {
   if (ticking || (state.paused && !force)) return;
   ticking = true;
+  if (beat++ % 60 === 5) checkUpdateStatus();
   try {
     const s = await invoke("snapshot");
     if (!s) return; // sampler hasn't produced its first sample yet
@@ -996,6 +1294,11 @@ async function tick(force = false) {
       renderTable();
       renderPanel();
       if (++tickCount % 3 === 0) refreshConns();
+      if (tickCount % 2 === 0) refreshFiles();
+    } else if (state.tab === "diagnose") {
+      await loadHistory(false);
+      renderDiagnose();
+      if (++tickCount % 2 === 0) refreshDxFiles();
     } else if (state.tab === "rules") {
       await loadRules();
       renderRules();
@@ -1091,12 +1394,12 @@ function mockInvoke(cmd, args) {
     // Record mock history (one point per call), seeded with 10 minutes on first call.
     const mkPoint = (t, c) => {
       const top = procs.reduce((a, p) => (p.cpu > a.cpu ? p : a), procs[0]);
-      return { t, cpu: c, mem: 47 + Math.random() * 3, gpu: gpu * Math.random(), disk: Math.random() * 2e7, net: Math.random() * 3e6, top: top.name, topCpu: top.cpu };
+      return { t, cpu: c, mem: 47 + Math.random() * 3, gpu: gpu * Math.random(), disk: Math.random() * 2e7, diskBusy: 40 + Math.random() * 55, net: Math.random() * 3e6, top: top.name, topCpu: top.cpu };
     };
     if (!m.hist.length) for (let i = 600; i > 0; i--) m.hist.push(mkPoint(Date.now() - i * 1000, Math.min(100, 20 + 15 * Math.sin(i / 40) + Math.random() * 10 + (i % 170 === 0 ? 60 : 0))));
     m.hist.push(mkPoint(Date.now(), cpu));
     return Promise.resolve({
-      gpu, gpuMem: 1.4e9,
+      gpu, gpuMem: 1.4e9, diskBusy: 60 + Math.random() * 38,
       cpu, cores: Array.from({ length: 16 }, () => Math.min(100, cpu * (0.4 + Math.random() * 1.2))),
       memUsed: procs.reduce((a, p) => a + p.mem, 0) + 4e9, memTotal: 32 * 1024 ** 3, swapUsed: 1.2e9, swapTotal: 8e9,
       netRx: Math.random() * 4e6 * wave(1), netTx: Math.random() * 6e5, diskRead: procs.reduce((a, p) => a + p.diskRead, 0), diskWrite: procs.reduce((a, p) => a + p.diskWrite, 0),
@@ -1121,6 +1424,19 @@ function mockInvoke(cmd, args) {
     const p = m.hist.reduce((a, b) => (Math.abs(b.t - args.t) < Math.abs(a.t - args.t) ? b : a));
     return Promise.resolve({ t: p.t, procs: m.procs.slice(0, 14).map((x, i) => ({ pid: x.pid, name: x.name, cpu: (p.cpu / (i + 2)), gpu: x.gpuBase, mem: x.memBase, disk: 0, net: 0 })) });
   }
+  if (cmd === "file_activity") {
+    const files = [
+      ["C:\\Users\\you\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Cache\\Cache_Data\\data_1", 0, 4.2e6],
+      ["C:\\pagefile.sys", 9.1e6, 2.2e6],
+      ["C:\\Users\\you\\AppData\\Roaming\\discord\\Local Storage\\leveldb\\000123.log", 0, 3.1e5],
+      ["(opened before Overseer started tracing)", 1.2e5, 0],
+    ];
+    const chrome = m.procs.find((p) => p.name === "chrome.exe");
+    return Promise.resolve(files.map(([path, read, write], i) => ({ pid: args.pid ?? [chrome.pid, 4, m.procs.find((p) => p.name === "Discord.exe")?.pid ?? 4, 4][i], path, read: read * Math.random(), write: write * Math.random(), ops: 40 + i * 13 })));
+  }
+  if (cmd === "update_status") return Promise.resolve({ version: "0.4.1", notes: "Mock update for the preview" });
+  if (cmd === "install_update") return Promise.reject("Updates can't be installed in the preview.");
+  if (cmd === "save_csv") { window.__lastCsv = args; return Promise.resolve(`C:\\Users\\you\\Downloads\\${args.name}`); }
   if (cmd === "file_hash") return Promise.resolve({ path: "C:\\mock\\file.exe", sha256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" });
   if (cmd === "connections") {
     const n = m.procs.find((x) => x.pid === args.pid)?.conns || 0;

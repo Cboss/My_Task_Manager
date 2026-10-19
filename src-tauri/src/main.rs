@@ -3,6 +3,7 @@
 
 mod autostart;
 mod etw;
+mod files;
 mod gpu;
 mod history;
 mod net;
@@ -45,6 +46,14 @@ struct Shared {
     history: Arc<Mutex<history::History>>,
     sigs: sig::Cache,
     sig_wanted: sig::Wanted,
+    files: files::Shared,
+    update: Arc<Mutex<Option<UpdateInfo>>>,
+}
+
+#[derive(Serialize, Clone)]
+struct UpdateInfo {
+    version: String,
+    notes: Option<String>,
 }
 
 /// Works whether sysinfo hands back `&str`/`String` or `&OsStr`/`OsString`.
@@ -77,6 +86,7 @@ pub struct Proc {
 pub struct Snapshot {
     gpu: f32,
     gpu_mem: u64,
+    disk_busy: f32,
     cpu: f32,
     cores: Vec<f32>,
     mem_used: u64,
@@ -212,6 +222,7 @@ fn sample(m: &mut Monitor, bandwidth: Option<&etw::Counters>, gpu: &gpu::Sample,
     Snapshot {
         gpu: gpu.total,
         gpu_mem: gpu.dedicated,
+        disk_busy: gpu.disk_busy,
         cpu: sys.global_cpu_usage(),
         cores: sys.cpus().iter().map(|c| c.cpu_usage()).collect(),
         mem_used: sys.used_memory(),
@@ -263,6 +274,9 @@ fn sampler(app: AppHandle, shared: Shared) {
             .unwrap_or(0);
         shared.history.lock().unwrap().push(now_ms, &snap);
         *shared.latest.lock().unwrap() = Some(snap);
+        if shared.bandwidth_on {
+            shared.files.lock().unwrap().rotate();
+        }
         std::thread::sleep(SAMPLE_EVERY.saturating_sub(started.elapsed()));
     }
 }
@@ -527,6 +541,68 @@ async fn set_autostart(enabled: bool, elevated: bool) -> Result<autostart::Statu
     autostart::status()
 }
 
+/// Busiest files over the last ~10 s, for one process or system-wide. Empty without admin.
+#[tauri::command]
+fn file_activity(state: State<'_, Shared>, pid: Option<u32>) -> Result<Vec<files::FileRow>, String> {
+    Ok(state.files.lock().map_err(|e| e.to_string())?.top(pid, 25))
+}
+
+/// Shows a Save dialog and writes the CSV the page built. Returns the path, or None if cancelled.
+#[tauri::command]
+async fn save_csv(app: AppHandle, name: String, contents: String) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let Some(picked) = app.dialog().file().add_filter("CSV", &["csv"]).set_file_name(&name).blocking_save_file() else {
+        return Ok(None);
+    };
+    let path = picked.into_path().map_err(|e| e.to_string())?;
+    // BOM so Excel opens UTF-8 (process names, signers) correctly.
+    std::fs::write(&path, format!("\u{FEFF}{contents}")).map_err(|e| format!("Couldn't save: {e}"))?;
+    Ok(Some(path.display().to_string()))
+}
+
+async fn find_update(app: &AppHandle) -> Result<Option<tauri_plugin_updater::Update>, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    app.updater().map_err(|e| e.to_string())?.check().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn update_status(state: State<'_, Shared>) -> Option<UpdateInfo> {
+    state.update.lock().ok()?.clone()
+}
+
+/// Downloads, verifies (signature) and runs the new installer. On Windows the
+/// installer closes Overseer itself and starts the new version when it's done.
+#[tauri::command]
+async fn install_update(app: AppHandle) -> Result<(), String> {
+    let update = find_update(&app).await?.ok_or("Overseer is already up to date.")?;
+    update.download_and_install(|_, _| {}, || {}).await.map_err(|e| format!("Update failed: {e}"))?;
+    app.restart();
+}
+
+/// Checks GitHub Releases shortly after start, then every 6 hours. Notifies once per version.
+fn update_checker(app: AppHandle, slot: Arc<Mutex<Option<UpdateInfo>>>) {
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(20));
+        let mut told: Option<String> = None;
+        loop {
+            if let Ok(Some(u)) = tauri::async_runtime::block_on(find_update(&app)) {
+                let info = UpdateInfo { version: u.version.clone(), notes: u.body.clone() };
+                if told.as_deref() != Some(info.version.as_str()) {
+                    let _ = app
+                        .notification()
+                        .builder()
+                        .title(format!("Overseer {} is available", info.version))
+                        .body("Open Overseer and click the update button in the top bar.")
+                        .show();
+                    told = Some(info.version.clone());
+                }
+                *slot.lock().unwrap() = Some(info);
+            }
+            std::thread::sleep(Duration::from_secs(6 * 3600));
+        }
+    });
+}
+
 #[tauri::command]
 fn restart_as_admin(app: AppHandle) -> Result<(), String> {
     win::relaunch_as_admin()?;
@@ -550,6 +626,8 @@ fn main() {
         // Must be first: a second launch just brings the running copy forward.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
@@ -561,7 +639,8 @@ fn main() {
         )
         .setup(move |app| {
             let bandwidth = etw::Counters::default();
-            let bandwidth_on = win::is_admin() && etw::start(bandwidth.clone()).is_ok();
+            let file_store = files::Shared::default();
+            let bandwidth_on = win::is_admin() && etw::start(bandwidth.clone(), file_store.clone()).is_ok();
             let rules_path = app.path().app_config_dir().ok().map(|d| d.join("rules.json"));
             let shared = Shared {
                 monitor: monitor.clone(),
@@ -572,9 +651,12 @@ fn main() {
                 history: Arc::new(Mutex::new(history::History::default())),
                 sigs: sig::Cache::default(),
                 sig_wanted: sig::Wanted::default(),
+                files: file_store,
+                update: Arc::new(Mutex::new(None)),
             };
             app.manage(shared.clone());
             sig::spawn(shared.sigs.clone(), shared.sig_wanted.clone());
+            update_checker(app.handle().clone(), shared.update.clone());
 
             build_tray(app)?;
             if let Err(e) = app.global_shortcut().register(hotkey()) {
@@ -629,6 +711,10 @@ fn main() {
             history_moment,
             file_hash,
             open_virustotal,
+            file_activity,
+            save_csv,
+            update_status,
+            install_update,
             restart_as_admin
         ])
         .build(tauri::generate_context!())

@@ -17,6 +17,7 @@ pub struct Point {
     mem: f32, // % of total
     gpu: f32,
     disk: f64, // bytes/s read + write
+    disk_busy: f32,
     net: f64,  // bytes/s down + up
     top: String,
     top_cpu: f32,
@@ -61,6 +62,7 @@ impl History {
             mem: s.mem_used as f32 / s.mem_total.max(1) as f32 * 100.0,
             gpu: s.gpu,
             disk: s.disk_read + s.disk_write,
+            disk_busy: s.disk_busy,
             net: s.net_rx + s.net_tx,
             top: top.map(|p| p.name.clone()).unwrap_or_default(),
             top_cpu: top.map(|p| p.cpu).unwrap_or(0.0),

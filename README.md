@@ -17,7 +17,9 @@ cargo run              # dev build (first build takes a few minutes)
 cargo run --release    # optimised build
 ```
 
-To produce an installer: `cargo install tauri-cli --version "^2"` then `cargo tauri build` (from `overseer/src-tauri`). The installer lands in `src-tauri/target/release/bundle/nsis/`.
+To produce an installer: `cargo install tauri-cli --version "^2"`, then run `.\release.ps1`. It builds a signed installer and copies it to the folder above this repo.
+
+To ship an update: bump `version` in `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml`, commit and push, then run `.\release.ps1 -Publish -Notes "what changed"`. That creates a GitHub release with the installer and `latest.json`; installed copies offer the update within 6 hours. Builds are signed with `%USERPROFILE%\.tauri\overseer.key` (keep a backup: without it, installed copies can't verify future updates).
 
 Start at sign-in: Startup tab → "Start Overseer when I sign in". Tick "as administrator" for per-process bandwidth; that uses a Task Scheduler logon task with highest privileges, so there's no UAC prompt. Overseer starts hidden in the tray (`--minimized`).
 

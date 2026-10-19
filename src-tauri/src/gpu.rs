@@ -27,6 +27,9 @@ pub struct Sample {
     pub per_pid: HashMap<u32, (f32, u64)>, // (utilisation %, dedicated bytes)
     pub total: f32,
     pub dedicated: u64,
+    /// Busiest physical disk's active time %, like Task Manager's disk graph.
+    /// Lives here because it's another PDH counter on the same query.
+    pub disk_busy: f32,
 }
 
 pub struct Gpu {
@@ -34,6 +37,7 @@ pub struct Gpu {
     engine: *mut c_void,
     proc_mem: *mut c_void,
     adapter_mem: *mut c_void,
+    disk_idle: *mut c_void,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -70,16 +74,23 @@ impl Gpu {
                 let p = wide(path);
                 (PdhAddEnglishCounterW(query, p.as_ptr(), 0, &mut c) == 0).then_some(c)
             };
-            let (Some(engine), Some(proc_mem), Some(adapter_mem)) = (
+            let (Some(engine), Some(proc_mem), Some(adapter_mem), Some(disk_idle)) = (
                 add(r"\GPU Engine(*)\Utilization Percentage"),
                 add(r"\GPU Process Memory(*)\Dedicated Usage"),
                 add(r"\GPU Adapter Memory(*)\Dedicated Usage"),
+                add(r"\PhysicalDisk(*)\% Idle Time"),
             ) else {
                 PdhCloseQuery(query);
                 return None;
             };
             PdhCollectQueryData(query); // rate counters need a baseline
-            Some(Self { query: query as _, engine: engine as _, proc_mem: proc_mem as _, adapter_mem: adapter_mem as _ })
+            Some(Self {
+                query: query as _,
+                engine: engine as _,
+                proc_mem: proc_mem as _,
+                adapter_mem: adapter_mem as _,
+                disk_idle: disk_idle as _,
+            })
         }
     }
 
@@ -123,6 +134,13 @@ impl Gpu {
                 }
             }
             out.dedicated = self.read(self.adapter_mem).iter().map(|(_, v)| *v as u64).sum();
+            // Least-idle disk wins; "_Total" averages disks together and would hide a busy one.
+            let min_idle = self
+                .read(self.disk_idle)
+                .iter()
+                .filter(|(name, _)| name != "_Total")
+                .fold(100.0f64, |a, (_, v)| a.min(*v));
+            out.disk_busy = (100.0 - min_idle).clamp(0.0, 100.0) as f32;
         }
         out
     }
